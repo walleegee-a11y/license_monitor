@@ -1,37 +1,6 @@
-# -----------------------------
-# GROUP-based policy definitions
-# Company is derived from the group name prefix (before first underscore)
-# MAX applies to the entire group (shared concurrent limit)
-# -----------------------------
+GROUP CIRCLE_PT circle-blue circle-pink circle-cyan
 
-GROUP scott_PT scott-nice
-GROUP sally_PT sally-cute
-GROUP joshua_DC joshua
-GROUP dhkim2_VC dhkim2
-GROUP ykpang_VCS ykpang
-GROUP nhkim_VCS nhkim
-GROUP root_MISC root
-
-# --- PrimeTime ---
 EXCLUDE PrimeTime ALL
 
-INCLUDE PrimeTime GROUP scott_PT
-MAX 2 PrimeTime GROUP scott_PT
-
-INCLUDE PrimeTime GROUP sally_PT
-MAX 1 PrimeTime GROUP sally_PT
-
-INCLUDE PrimeTime GROUP root_MISC
-MAX 1 PrimeTime GROUP root_MISC
-
-# --- Design-Compiler ---
-EXCLUDE Design-Compiler ALL
-
-INCLUDE Design-Compiler GROUP scott_PT
-MAX 2 Design-Compiler GROUP scott_PT
-
-INCLUDE Design-Compiler GROUP sally_PT
-MAX 1 Design-Compiler GROUP sally_PT
-
-INCLUDE Design-Compiler GROUP joshua_DC
-MAX 2 Design-Compiler GROUP joshua_DC
+INCLUDE PrimeTime GROUP CIRCLE_PT
+MAX 2 PrimeTime GROUP CIRCLE_PT
