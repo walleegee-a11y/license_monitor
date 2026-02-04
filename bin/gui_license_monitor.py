@@ -317,6 +317,42 @@ class CollectorThread(QThread):
 
 
 # ============================================================
+# IngestThread — run ingest scripts in background
+# ============================================================
+
+class IngestThread(QThread):
+    """Background thread that runs an ingest Python script."""
+
+    ingest_complete = pyqtSignal(str)   # success message
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, script_path, env_vars, label, args=None):
+        super().__init__()
+        self.script_path = script_path
+        self.env_vars = env_vars
+        self.label = label
+        self.args = args or []
+
+    def run(self):
+        try:
+            env = os.environ.copy()
+            env.update(self.env_vars)
+            cmd = [sys.executable, self.script_path] + self.args
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300, env=env
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                self.error_occurred.emit(f"{self.label} failed:\n{err[:500]}")
+                return
+            self.ingest_complete.emit(f"{self.label} completed successfully.")
+        except subprocess.TimeoutExpired:
+            self.error_occurred.emit(f"{self.label} timed out (300s).")
+        except Exception as e:
+            self.error_occurred.emit(f"{self.label} error: {e}")
+
+
+# ============================================================
 # Helper: time-bin aggregation and X-axis scaling
 # ============================================================
 
@@ -450,6 +486,7 @@ class LicenseMonitorGUI(QMainWindow):
         self.filtered_data = None     # after filter selection
         self.analyzer_thread = None
         self.collector_thread = None
+        self.ingest_thread = None
         self._collect_then_analyze = False
         self.policy_rows = []         # [(user, company, feature, policy_max), ...]
         self.policy_map = {}          # {feature: policy_max} — computed per filter
@@ -533,6 +570,17 @@ class LicenseMonitorGUI(QMainWindow):
         self.export_html_btn.clicked.connect(self._export_html)
         action_row2.addWidget(self.export_html_btn)
         action_layout.addLayout(action_row2)
+
+        action_row3 = QHBoxLayout()
+        self.ingest_lmstat_btn = QPushButton("Ingest Lmstat")
+        self.ingest_lmstat_btn.setToolTip("Run ingest_lmstat.py to load raw lmstat files into the database")
+        self.ingest_lmstat_btn.clicked.connect(self._run_ingest_lmstat)
+        action_row3.addWidget(self.ingest_lmstat_btn)
+        self.ingest_policy_btn = QPushButton("Ingest Policy")
+        self.ingest_policy_btn.setToolTip("Run ingest_policy.py to reload policy from options.opt into the database")
+        self.ingest_policy_btn.clicked.connect(self._run_ingest_policy)
+        action_row3.addWidget(self.ingest_policy_btn)
+        action_layout.addLayout(action_row3)
 
         action_group.setLayout(action_layout)
         top_bar.addWidget(action_group)
@@ -869,6 +917,53 @@ class LicenseMonitorGUI(QMainWindow):
         if self._collect_then_analyze:
             self._collect_then_analyze = False
             self._start_analysis()
+
+    # --------------------------------------------------------
+    # Ingest lmstat / policy
+    # --------------------------------------------------------
+    def _run_ingest_lmstat(self):
+        """Run ingest_lmstat.py to load raw files into the database."""
+        self.ingest_lmstat_btn.setEnabled(False)
+        self.ingest_policy_btn.setEnabled(False)
+        self.status_bar.showMessage("Ingesting lmstat data...")
+
+        script = str(BASE_DIR / "bin" / "ingest_lmstat.py")
+        env = {
+            "RAW_LMSTAT_DIR": str(RAW_DIR),
+            "DB_DIR": str(DB_PATH.parent),
+        }
+        self.ingest_thread = IngestThread(script, env, "Ingest Lmstat")
+        self.ingest_thread.ingest_complete.connect(self._on_ingest_complete)
+        self.ingest_thread.error_occurred.connect(self._on_ingest_error)
+        self.ingest_thread.start()
+
+    def _run_ingest_policy(self):
+        """Run ingest_policy.py to reload policy from options.opt."""
+        self.ingest_lmstat_btn.setEnabled(False)
+        self.ingest_policy_btn.setEnabled(False)
+        self.status_bar.showMessage("Ingesting policy...")
+
+        script = str(BASE_DIR / "bin" / "ingest_policy.py")
+        env = {
+            "LICENSE_MONITOR_HOME": str(BASE_DIR),
+        }
+        args = [str(BASE_DIR / "bin" / "options.opt")]
+        self.ingest_thread = IngestThread(script, env, "Ingest Policy", args=args)
+        self.ingest_thread.ingest_complete.connect(self._on_ingest_complete)
+        self.ingest_thread.error_occurred.connect(self._on_ingest_error)
+        self.ingest_thread.start()
+
+    def _on_ingest_complete(self, msg):
+        self.ingest_lmstat_btn.setEnabled(True)
+        self.ingest_policy_btn.setEnabled(True)
+        self.status_bar.showMessage(msg)
+        self._load_policy()
+
+    def _on_ingest_error(self, msg):
+        self.ingest_lmstat_btn.setEnabled(True)
+        self.ingest_policy_btn.setEnabled(True)
+        self.status_bar.showMessage(f"Ingest error: {msg[:100]}")
+        QMessageBox.warning(self, "Ingest Error", msg)
 
     # --------------------------------------------------------
     # Chart options helpers
