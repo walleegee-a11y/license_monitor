@@ -127,14 +127,12 @@ class LmstatParser:
                         user = tokens[0]
                         host = tokens[1]
 
-                        if user_company_map:
-                            if user not in user_company_map:
-                                continue
+                        if user_company_map and user in user_company_map:
                             company = user_company_map[user]
-                        else:
-                            if not USER_RE.match(user):
-                                continue
+                        elif "-" in user:
                             company = user.split("-")[0]
+                        else:
+                            company = "unknown"
 
                         records.append({
                             "ts": ts_str,

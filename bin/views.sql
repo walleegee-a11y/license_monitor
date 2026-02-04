@@ -33,7 +33,13 @@ DROP VIEW IF EXISTS v_usage_base;
 CREATE VIEW v_usage_base AS
 SELECT
   u.user,
-  COALESCE(p.company, substr(u.user,1,instr(u.user,'-')-1)) AS company,
+  COALESCE(
+    p.company,
+    CASE WHEN instr(u.user, '-') > 0
+         THEN substr(u.user, 1, instr(u.user, '-') - 1)
+         ELSE u.user
+    END
+  ) AS company,
   u.feature,
   u.ts_norm
 FROM v_usage_ts_norm u

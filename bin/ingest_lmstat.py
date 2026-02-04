@@ -63,11 +63,8 @@ with open(path) as f:
             user = parts[0]
             host = parts[1]
 
-            # enforce external user policy
-            if policy_users:
-                if user not in policy_users:
-                    continue
-            elif not USER_RE.match(user):
+            # skip lines that don't look like real user checkouts
+            if not policy_users and not USER_RE.match(user) and "-" not in user:
                 continue
 
             cur.execute(
