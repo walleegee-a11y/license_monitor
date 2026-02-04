@@ -1,6 +1,11 @@
 GROUP CIRCLE_PT circle-blue circle-pink circle-cyan
+GROUP PEBBLESQUARE_Verdi pebblesqare-stone
 
 EXCLUDE PrimeTime ALL
+EXCLUDE Verdi
 
 INCLUDE PrimeTime GROUP CIRCLE_PT
 MAX 2 PrimeTime GROUP CIRCLE_PT
+
+INCLUDE Verdi GROUP PEBBLESQUARE_Verdi
+MAX 2 Verdi GROUP PEBBLESQUARE_Verdi
