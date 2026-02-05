@@ -474,6 +474,22 @@ def fill_missing_time_bins(agg, start_date, end_date, granularity, bin_fmt):
 
 
 # ============================================================
+# Custom table item for numeric sorting with formatted display
+# ============================================================
+
+class NumericSortItem(QTableWidgetItem):
+    """QTableWidgetItem that displays formatted text but sorts numerically."""
+    def __init__(self, display_text, sort_value):
+        super().__init__(display_text)
+        self._sort_value = sort_value
+
+    def __lt__(self, other):
+        if isinstance(other, NumericSortItem):
+            return self._sort_value < other._sort_value
+        return super().__lt__(other)
+
+
+# ============================================================
 # Main GUI Application
 # ============================================================
 
@@ -1054,6 +1070,9 @@ class LicenseMonitorGUI(QMainWindow):
         self.analyze_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
 
+        # Compute policy map before populating filters (so policy features appear)
+        self._compute_policy_map(None)
+
         # Populate filter lists — all selected by default
         self._populate_filters(df)
 
@@ -1138,7 +1157,11 @@ class LicenseMonitorGUI(QMainWindow):
         self.user_list.clear()
 
         if not df.empty:
-            for feat in sorted(df["feature"].unique()):
+            # Merge features from data with features from policy_map
+            data_features = set(df["feature"].unique())
+            policy_features = set(self.policy_map.keys())
+            all_features = sorted(data_features | policy_features)
+            for feat in all_features:
                 item = QListWidgetItem(feat)
                 self.feature_list.addItem(item)
                 item.setSelected(True)
@@ -1341,14 +1364,13 @@ class LicenseMonitorGUI(QMainWindow):
                                         fontsize=max(fs - 3, 5), ha="center",
                                         color=feat_colors.get(feat, "black"))
 
-        # Policy overlay — same color as its feature
-        for feat in features:
-            if feat in self.policy_map:
-                color = feat_colors.get(feat, None)
-                ax.axhline(y=self.policy_map[feat], linestyle="--",
-                           linewidth=max(lw * 0.8, 0.6), alpha=0.7,
-                           color=color,
-                           label=f"{feat} MAX={self.policy_map[feat]}")
+        # Policy overlay — same color as its feature, or default for zero-usage
+        for feat in self.policy_map:
+            color = feat_colors.get(feat, None)
+            ax.axhline(y=self.policy_map[feat], linestyle="--",
+                       linewidth=max(lw * 0.8, 0.6), alpha=0.7,
+                       color=color,
+                       label=f"{feat} MAX={self.policy_map[feat]}")
 
         # Current time marker
         now_dt = datetime.now()
@@ -1454,6 +1476,11 @@ class LicenseMonitorGUI(QMainWindow):
         item.setData(Qt.DisplayRole, value)
         return item
 
+    @staticmethod
+    def _make_hours_item(value):
+        """Create a QTableWidgetItem for hours that always shows 2 decimal places."""
+        return NumericSortItem(f"{value:.2f}", float(value))
+
     # --------------------------------------------------------
     # Statistics tab
     # --------------------------------------------------------
@@ -1469,41 +1496,53 @@ class LicenseMonitorGUI(QMainWindow):
         self.stats_table.setSortingEnabled(False)
         self.stats_table.setRowCount(0)
 
-        if df.empty:
+        # Merge features from data with features from policy_map
+        data_features = set(df["feature"].unique()) if not df.empty else set()
+        policy_features = set(self.policy_map.keys())
+        all_features = sorted(data_features | policy_features)
+
+        if not all_features:
             self.stats_table.setSortingEnabled(True)
             return
 
-        df = df.copy()
-        df["datetime"] = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+        if not df.empty:
+            df = df.copy()
+            df["datetime"] = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
 
         interval_min = self._snapshot_interval_minutes()
         period_hours = self._get_period_hours()
-        total_snapshots = df["ts"].nunique()
-        features = sorted(df["feature"].unique())
+        total_snapshots = df["ts"].nunique() if not df.empty else 0
 
-        for row_idx, feat in enumerate(features):
-            fdf = df[df["feature"] == feat]
-            total_checkouts = len(fdf)
-            unique_users = fdf["user"].nunique()
-            active_days = fdf["datetime"].dt.date.nunique()
+        for row_idx, feat in enumerate(all_features):
+            if not df.empty and feat in data_features:
+                fdf = df[df["feature"] == feat]
+                total_checkouts = len(fdf)
+                unique_users = fdf["user"].nunique()
+                active_days = fdf["datetime"].dt.date.nunique()
 
-            # Concurrent per snapshot: count rows per unique ts
-            concurrent_per_snap = fdf.groupby("ts").size()
-            # Divide by ALL snapshots in the period (not just ones where this feature appears)
-            avg_concurrent = float(round(concurrent_per_snap.sum() / total_snapshots, 2)) if total_snapshots > 0 else 0
-            peak_concurrent = int(concurrent_per_snap.max()) if not concurrent_per_snap.empty else 0
+                concurrent_per_snap = fdf.groupby("ts").size()
+                avg_concurrent = float(round(concurrent_per_snap.sum() / total_snapshots, 2)) if total_snapshots > 0 else 0
+                peak_concurrent = int(concurrent_per_snap.max()) if not concurrent_per_snap.empty else 0
 
-            # Usage Hours: sum of per-user session durations for this feature
-            est_usage_hours = 0.0
-            for usr in fdf["user"].unique():
-                _, usr_hrs = self._compute_sessions(fdf[fdf["user"] == usr]["ts"], interval_min)
-                est_usage_hours += usr_hrs
-            est_usage_hours = round(est_usage_hours, 1)
+                est_usage_hours = 0.0
+                for usr in fdf["user"].unique():
+                    _, usr_hrs = self._compute_sessions(fdf[fdf["user"] == usr]["ts"], interval_min)
+                    est_usage_hours += usr_hrs
+                est_usage_hours = round(est_usage_hours, 2)
 
-            # First/Last Seen
-            valid_dt = fdf["datetime"].dropna()
-            first_seen = str(valid_dt.min()) if not valid_dt.empty else "-"
-            last_seen = str(valid_dt.max()) if not valid_dt.empty else "-"
+                valid_dt = fdf["datetime"].dropna()
+                first_seen = str(valid_dt.min()) if not valid_dt.empty else "-"
+                last_seen = str(valid_dt.max()) if not valid_dt.empty else "-"
+            else:
+                # Feature from policy with zero usage
+                total_checkouts = 0
+                unique_users = 0
+                active_days = 0
+                avg_concurrent = 0
+                peak_concurrent = 0
+                est_usage_hours = 0.0
+                first_seen = "-"
+                last_seen = "-"
 
             policy_max = self.policy_map.get(feat, None)
 
@@ -1514,7 +1553,7 @@ class LicenseMonitorGUI(QMainWindow):
             self.stats_table.setItem(row_idx, 3, self._make_numeric_item(active_days))
             self.stats_table.setItem(row_idx, 4, self._make_numeric_item(avg_concurrent))
             self.stats_table.setItem(row_idx, 5, self._make_numeric_item(peak_concurrent))
-            self.stats_table.setItem(row_idx, 6, self._make_numeric_item(est_usage_hours))
+            self.stats_table.setItem(row_idx, 6, self._make_hours_item(est_usage_hours))
             self.stats_table.setItem(row_idx, 7, QTableWidgetItem(first_seen))
             self.stats_table.setItem(row_idx, 8, QTableWidgetItem(last_seen))
 
@@ -1600,10 +1639,10 @@ class LicenseMonitorGUI(QMainWindow):
                 s_count, s_hours = self._compute_sessions(uf_feat["ts"], interval_min)
                 est_usage_hours += s_hours
                 total_sessions += s_count
-            est_usage_hours = round(est_usage_hours, 1)
+            est_usage_hours = round(est_usage_hours, 2)
 
-            avg_hours_day = round(est_usage_hours / period_days, 1)
-            avg_hours_day_copy = round(avg_hours_day / features_used, 1) if features_used > 0 else 0.0
+            avg_hours_day = round(est_usage_hours / period_days, 2)
+            avg_hours_day_copy = round(avg_hours_day / features_used, 2) if features_used > 0 else 0.0
             avg_session_hrs = round(est_usage_hours / total_sessions, 2) if total_sessions > 0 else 0.0
 
             self.user_activity_table.insertRow(row_idx)
@@ -1611,14 +1650,14 @@ class LicenseMonitorGUI(QMainWindow):
             self.user_activity_table.setItem(row_idx, 1, QTableWidgetItem(company))
             self.user_activity_table.setItem(row_idx, 2, self._make_numeric_item(features_used))
             self.user_activity_table.setItem(row_idx, 3, self._make_numeric_item(total_checkouts))
-            self.user_activity_table.setItem(row_idx, 4, self._make_numeric_item(est_usage_hours))
+            self.user_activity_table.setItem(row_idx, 4, self._make_hours_item(est_usage_hours))
             self.user_activity_table.setItem(row_idx, 5, self._make_numeric_item(active_days))
             self.user_activity_table.setItem(row_idx, 6, QTableWidgetItem(first_active))
             self.user_activity_table.setItem(row_idx, 7, QTableWidgetItem(last_active))
-            self.user_activity_table.setItem(row_idx, 8, self._make_numeric_item(avg_hours_day))
-            self.user_activity_table.setItem(row_idx, 9, self._make_numeric_item(avg_hours_day_copy))
+            self.user_activity_table.setItem(row_idx, 8, self._make_hours_item(avg_hours_day))
+            self.user_activity_table.setItem(row_idx, 9, self._make_hours_item(avg_hours_day_copy))
             self.user_activity_table.setItem(row_idx, 10, self._make_numeric_item(total_sessions))
-            self.user_activity_table.setItem(row_idx, 11, self._make_numeric_item(avg_session_hrs))
+            self.user_activity_table.setItem(row_idx, 11, self._make_hours_item(avg_session_hrs))
 
         self.user_activity_table.resizeColumnsToContents()
         self.user_activity_table.setSortingEnabled(True)
