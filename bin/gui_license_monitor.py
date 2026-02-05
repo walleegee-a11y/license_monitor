@@ -52,6 +52,7 @@ DB_PATH = BASE_DIR / "db" / "license_monitor.db"
 EXPORT_DIR = BASE_DIR / "exports"
 
 USER_RE = re.compile(r"^[a-z0-9]+-[a-z]{4}$")
+SNAPSHOT_INTERVAL_MIN = None       # auto-detected from data via median gap
 
 
 # ============================================================
@@ -523,7 +524,7 @@ class LicenseMonitorGUI(QMainWindow):
         period_layout.addLayout(quick_row)
 
         custom_row = QHBoxLayout()
-        custom_row.addWidget(QLabel("Custom:"))
+        custom_row.addWidget(QLabel("Period:"))
         custom_row.addWidget(QLabel("Start"))
         self.start_date_edit = QDateEdit()
         self.start_date_edit.setCalendarPopup(True)
@@ -768,7 +769,7 @@ class LicenseMonitorGUI(QMainWindow):
         self.stats_table.setColumnCount(12)
         self.stats_table.setHorizontalHeaderLabels([
             "Feature", "Total Checkouts", "Unique Users", "Active Days",
-            "Avg Concurrent", "Peak Concurrent", "Est. Usage Hours",
+            "Avg Concurrent", "Peak Concurrent", "Usage Hours",
             "First Seen", "Last Seen",
             "Policy Max", "Utilization", "Hours Util. %",
         ])
@@ -778,11 +779,11 @@ class LicenseMonitorGUI(QMainWindow):
 
         # Tab 3: User Activity table
         self.user_activity_table = QTableWidget()
-        self.user_activity_table.setColumnCount(9)
+        self.user_activity_table.setColumnCount(12)
         self.user_activity_table.setHorizontalHeaderLabels([
             "User", "Company", "Features Used", "Total Checkouts",
-            "Est. Usage Hours", "Active Days", "First Active", "Last Active",
-            "Avg Hours/Day",
+            "Usage Hours", "Active Days", "First Active", "Last Active",
+            "Avg Hrs/Day", "Avg Hrs/Day/Copy", "Sessions", "Avg Session Hrs",
         ])
         self.user_activity_table.horizontalHeader().setStretchLastSection(True)
         self.user_activity_table.setSortingEnabled(True)
@@ -1049,6 +1050,7 @@ class LicenseMonitorGUI(QMainWindow):
 
     def _on_analysis_complete(self, df, file_count):
         self.raw_data = df
+        self._cached_interval = None   # reset so interval is re-detected
         self.analyze_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
 
@@ -1058,12 +1060,14 @@ class LicenseMonitorGUI(QMainWindow):
         # Apply filters (initially everything selected) → draw chart + tables
         self._apply_and_refresh()
 
+        interval = self._snapshot_interval_minutes()
         start_str = self.start_date_edit.date().toString("yyyy-MM-dd")
         end_str = self.end_date_edit.date().toString("yyyy-MM-dd")
         rec_count = len(df)
         self.status_bar.showMessage(
             f"Analyzed {file_count} files, {rec_count} records  |  "
-            f"Period: {start_str} to {end_str}"
+            f"Period: {start_str} to {end_str}  |  "
+            f"Interval: {interval} min"
         )
 
     def _on_analysis_error(self, msg):
@@ -1309,17 +1313,20 @@ class LicenseMonitorGUI(QMainWindow):
                 x, y = fdata["plot_dt"], fdata["concurrent"]
                 if ct == "area":
                     line, = ax.plot(x, y, marker=mk, linewidth=lw, markersize=4,
-                                    linestyle=ls, label=feat)
-                    ax.fill_between(x, y, alpha=0.15, color=line.get_color())
+                                    linestyle=ls, label=feat,
+                                    drawstyle="steps-post")
+                    ax.fill_between(x, y, alpha=0.15, color=line.get_color(),
+                                    step="post")
                 elif ct == "step":
-                    line, = ax.step(x, y, where="mid", linewidth=lw,
+                    line, = ax.step(x, y, where="post", linewidth=lw,
                                     linestyle=ls, label=feat)
                     if mk:
                         ax.plot(x, y, marker=mk, linewidth=0, markersize=4,
                                 color=line.get_color())
                 else:  # line
                     line, = ax.plot(x, y, marker=mk, linewidth=lw, markersize=4,
-                                    linestyle=ls, label=feat)
+                                    linestyle=ls, label=feat,
+                                    drawstyle="steps-post")
                 feat_colors[feat] = line.get_color()
 
                 # Annotate transition points (where value changes)
@@ -1380,17 +1387,65 @@ class LicenseMonitorGUI(QMainWindow):
     # --------------------------------------------------------
     # Helpers
     # --------------------------------------------------------
-    def _estimate_interval_minutes(self, df):
-        """Estimate the average snapshot interval in minutes from timestamps."""
-        if df.empty:
-            return 0.0
-        timestamps = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce").dropna()
+    def _snapshot_interval_minutes(self):
+        """Return the lmstat collection interval in minutes.
+
+        Uses median gap between consecutive snapshots in the current dataset,
+        which is robust against ad-hoc collections (GUI 'Collect Now' etc.).
+        Falls back to 5 minutes if insufficient data.
+        """
+        if getattr(self, '_cached_interval', None) is not None:
+            return self._cached_interval
+        if self.raw_data is None or self.raw_data.empty:
+            return SNAPSHOT_INTERVAL_MIN or 5
+        timestamps = pd.to_datetime(
+            self.raw_data["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce"
+        ).dropna()
         unique_ts = sorted(timestamps.unique())
         if len(unique_ts) < 2:
-            return 0.0
-        total_delta = unique_ts[-1] - unique_ts[0]
-        avg_interval = total_delta / (len(unique_ts) - 1)
-        return avg_interval.total_seconds() / 60.0
+            return SNAPSHOT_INTERVAL_MIN or 5
+        gaps = [(unique_ts[i] - unique_ts[i - 1]).total_seconds() / 60.0
+                for i in range(1, len(unique_ts))]
+        median_gap = sorted(gaps)[len(gaps) // 2]
+        # Clamp to reasonable range (1–60 min) to avoid outlier issues
+        self._cached_interval = max(1.0, min(60.0, round(median_gap, 1)))
+        return self._cached_interval
+
+    @staticmethod
+    def _compute_sessions(ts_series, interval_min):
+        """Detect sessions and compute total session duration.
+
+        Returns (session_count, total_session_hours).
+        A session = consecutive snapshots with gap <= 2.5x interval.
+        Duration per session = (last_ts - first_ts) + interval.
+        """
+        ts_parsed = pd.to_datetime(ts_series, format="%Y-%m-%d %H:%M:%S", errors="coerce").dropna()
+        unique_ts = sorted(ts_parsed.unique())
+        if not unique_ts:
+            return 0, 0.0
+        if len(unique_ts) == 1:
+            return 1, round(interval_min / 60.0, 2)
+
+        gap_threshold = pd.Timedelta(minutes=interval_min * 2.5)
+        interval_td = pd.Timedelta(minutes=interval_min)
+
+        session_hours = []
+        session_start = unique_ts[0]
+        session_end = unique_ts[0]
+
+        for i in range(1, len(unique_ts)):
+            if (unique_ts[i] - unique_ts[i - 1]) > gap_threshold:
+                # Close current session
+                dur = (session_end - session_start) + interval_td
+                session_hours.append(dur.total_seconds() / 3600.0)
+                session_start = unique_ts[i]
+            session_end = unique_ts[i]
+
+        # Close last session
+        dur = (session_end - session_start) + interval_td
+        session_hours.append(dur.total_seconds() / 3600.0)
+
+        return len(session_hours), round(sum(session_hours), 2)
 
     @staticmethod
     def _make_numeric_item(value):
@@ -1421,7 +1476,7 @@ class LicenseMonitorGUI(QMainWindow):
         df = df.copy()
         df["datetime"] = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
 
-        interval_min = self._estimate_interval_minutes(df)
+        interval_min = self._snapshot_interval_minutes()
         period_hours = self._get_period_hours()
         total_snapshots = df["ts"].nunique()
         features = sorted(df["feature"].unique())
@@ -1438,8 +1493,12 @@ class LicenseMonitorGUI(QMainWindow):
             avg_concurrent = float(round(concurrent_per_snap.sum() / total_snapshots, 2)) if total_snapshots > 0 else 0
             peak_concurrent = int(concurrent_per_snap.max()) if not concurrent_per_snap.empty else 0
 
-            # Est. Usage Hours: number of snapshot appearances × interval / 60
-            est_usage_hours = round(total_checkouts * interval_min / 60.0, 1) if interval_min > 0 else 0.0
+            # Usage Hours: sum of per-user session durations for this feature
+            est_usage_hours = 0.0
+            for usr in fdf["user"].unique():
+                _, usr_hrs = self._compute_sessions(fdf[fdf["user"] == usr]["ts"], interval_min)
+                est_usage_hours += usr_hrs
+            est_usage_hours = round(est_usage_hours, 1)
 
             # First/Last Seen
             valid_dt = fdf["datetime"].dropna()
@@ -1503,6 +1562,12 @@ class LicenseMonitorGUI(QMainWindow):
     # --------------------------------------------------------
     # User Activity tab
     # --------------------------------------------------------
+    def _get_period_days(self):
+        """Return number of days in the selected period (inclusive)."""
+        start_qd = self.start_date_edit.date()
+        end_qd = self.end_date_edit.date()
+        return max(start_qd.daysTo(end_qd) + 1, 1)
+
     def _update_user_activity(self, df):
         self.user_activity_table.setSortingEnabled(False)
         self.user_activity_table.setRowCount(0)
@@ -1513,7 +1578,8 @@ class LicenseMonitorGUI(QMainWindow):
 
         df = df.copy()
         df["datetime"] = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
-        interval_min = self._estimate_interval_minutes(df)
+        interval_min = self._snapshot_interval_minutes()
+        period_days = self._get_period_days()
 
         users = sorted(df["user"].unique())
         for row_idx, user in enumerate(users):
@@ -1521,12 +1587,24 @@ class LicenseMonitorGUI(QMainWindow):
             company = udf["company"].iloc[0]
             features_used = udf["feature"].nunique()
             total_checkouts = len(udf)
-            est_usage_hours = round(total_checkouts * interval_min / 60.0, 1) if interval_min > 0 else 0.0
             valid_dt = udf["datetime"].dropna()
             active_days = valid_dt.dt.date.nunique() if not valid_dt.empty else 0
             first_active = str(valid_dt.min()) if not valid_dt.empty else "-"
             last_active = str(valid_dt.max()) if not valid_dt.empty else "-"
-            avg_hours_day = round(est_usage_hours / active_days, 1) if active_days > 0 else 0.0
+
+            # Session-based usage: sum per-feature session durations
+            est_usage_hours = 0.0
+            total_sessions = 0
+            for feat in udf["feature"].unique():
+                uf_feat = udf[udf["feature"] == feat]
+                s_count, s_hours = self._compute_sessions(uf_feat["ts"], interval_min)
+                est_usage_hours += s_hours
+                total_sessions += s_count
+            est_usage_hours = round(est_usage_hours, 1)
+
+            avg_hours_day = round(est_usage_hours / period_days, 1)
+            avg_hours_day_copy = round(avg_hours_day / features_used, 1) if features_used > 0 else 0.0
+            avg_session_hrs = round(est_usage_hours / total_sessions, 2) if total_sessions > 0 else 0.0
 
             self.user_activity_table.insertRow(row_idx)
             self.user_activity_table.setItem(row_idx, 0, QTableWidgetItem(user))
@@ -1538,6 +1616,9 @@ class LicenseMonitorGUI(QMainWindow):
             self.user_activity_table.setItem(row_idx, 6, QTableWidgetItem(first_active))
             self.user_activity_table.setItem(row_idx, 7, QTableWidgetItem(last_active))
             self.user_activity_table.setItem(row_idx, 8, self._make_numeric_item(avg_hours_day))
+            self.user_activity_table.setItem(row_idx, 9, self._make_numeric_item(avg_hours_day_copy))
+            self.user_activity_table.setItem(row_idx, 10, self._make_numeric_item(total_sessions))
+            self.user_activity_table.setItem(row_idx, 11, self._make_numeric_item(avg_session_hrs))
 
         self.user_activity_table.resizeColumnsToContents()
         self.user_activity_table.setSortingEnabled(True)
@@ -1654,8 +1735,10 @@ class LicenseMonitorGUI(QMainWindow):
                 for feat in features:
                     fdata = agg[agg["feature"] == feat].sort_values("plot_dt")
                     x, y = fdata["plot_dt"], fdata["concurrent"]
-                    line, = ax.plot(x, y, linewidth=1.5, label=feat)
-                    ax.fill_between(x, y, alpha=0.15, color=line.get_color())
+                    line, = ax.plot(x, y, linewidth=1.5, label=feat,
+                                    drawstyle="steps-post")
+                    ax.fill_between(x, y, alpha=0.15, color=line.get_color(),
+                                    step="post")
                     feat_colors[feat] = line.get_color()
 
                 pmap = policy_map if policy_map is not None else self.policy_map
@@ -1703,7 +1786,7 @@ class LicenseMonitorGUI(QMainWindow):
         pmap = policy_map if policy_map is not None else self.policy_map
         df = df.copy()
         df["datetime"] = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
-        interval_min = self._estimate_interval_minutes(df)
+        interval_min = self._snapshot_interval_minutes()
         ph = period_hours if period_hours else 1.0
         total_snapshots = df["ts"].nunique()
         rows = []
@@ -1716,7 +1799,12 @@ class LicenseMonitorGUI(QMainWindow):
             # Divide by ALL snapshots (not just ones where this feature appears)
             avg_conc = round(float(concurrent_per_snap.sum() / total_snapshots), 2) if total_snapshots > 0 else 0
             peak_conc = int(concurrent_per_snap.max()) if not concurrent_per_snap.empty else 0
-            est_usage_hours = round(total_checkouts * interval_min / 60.0, 1) if interval_min > 0 else 0.0
+            # Usage Hours: sum of per-user session durations for this feature
+            est_usage_hours = 0.0
+            for usr in fdf["user"].unique():
+                _, usr_hrs = self._compute_sessions(fdf[fdf["user"] == usr]["ts"], interval_min)
+                est_usage_hours += usr_hrs
+            est_usage_hours = round(est_usage_hours, 1)
             valid_dt = fdf["datetime"].dropna()
             first_seen = str(valid_dt.min()) if not valid_dt.empty else "-"
             last_seen = str(valid_dt.max()) if not valid_dt.empty else "-"
@@ -1803,13 +1891,20 @@ class LicenseMonitorGUI(QMainWindow):
         """Build per-company statistics."""
         if df.empty:
             return []
-        interval_min = self._estimate_interval_minutes(df)
+        interval_min = self._snapshot_interval_minutes()
         rows = []
         for comp in sorted(df["company"].unique()):
             cdf = df[df["company"] == comp]
             total_checkouts = len(cdf)
             concurrent_per_snap = cdf.groupby("ts").size()
-            est_usage_hours = round(total_checkouts * interval_min / 60.0, 1) if interval_min > 0 else 0.0
+            # Session-based usage: sum per (user, feature) session durations
+            est_usage_hours = 0.0
+            for usr in cdf["user"].unique():
+                udf = cdf[cdf["user"] == usr]
+                for feat in udf["feature"].unique():
+                    _, s_hrs = self._compute_sessions(udf[udf["feature"] == feat]["ts"], interval_min)
+                    est_usage_hours += s_hrs
+            est_usage_hours = round(est_usage_hours, 1)
             rows.append({
                 "company": comp,
                 "features_used": cdf["feature"].nunique(),
@@ -1844,7 +1939,7 @@ class LicenseMonitorGUI(QMainWindow):
             return []
         df = df.copy()
         df["datetime"] = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
-        interval_min = self._estimate_interval_minutes(df)
+        interval_min = self._snapshot_interval_minutes()
         results = []
         user_stats = (
             df.groupby("user")
@@ -1861,7 +1956,11 @@ class LicenseMonitorGUI(QMainWindow):
             udf = df[df["user"] == row["user"]]
             valid_dt = udf["datetime"].dropna()
             active_days = valid_dt.dt.date.nunique() if not valid_dt.empty else 0
-            est_hours = round(row["total_checkouts"] * interval_min / 60.0, 1) if interval_min > 0 else 0.0
+            est_hours = 0.0
+            for feat in udf["feature"].unique():
+                _, s_hrs = self._compute_sessions(udf[udf["feature"] == feat]["ts"], interval_min)
+                est_hours += s_hrs
+            est_hours = round(est_hours, 1)
             first_active = str(valid_dt.min()) if not valid_dt.empty else "-"
             last_active = str(valid_dt.max()) if not valid_dt.empty else "-"
             results.append({
@@ -1882,19 +1981,32 @@ class LicenseMonitorGUI(QMainWindow):
             return []
         df = df.copy()
         df["datetime"] = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
-        interval_min = self._estimate_interval_minutes(df)
+        interval_min = self._snapshot_interval_minutes()
+        period_days = self._get_period_days()
         results = []
         for user in sorted(df["user"].unique()):
             udf = df[df["user"] == user]
             company = udf["company"].iloc[0]
             features_used = udf["feature"].nunique()
             total_checkouts = len(udf)
-            est_hours = round(total_checkouts * interval_min / 60.0, 1) if interval_min > 0 else 0.0
             valid_dt = udf["datetime"].dropna()
             active_days = valid_dt.dt.date.nunique() if not valid_dt.empty else 0
             first_active = str(valid_dt.min()) if not valid_dt.empty else "-"
             last_active = str(valid_dt.max()) if not valid_dt.empty else "-"
-            avg_hours_day = round(est_hours / active_days, 1) if active_days > 0 else 0.0
+
+            # Session-based usage: sum per-feature session durations
+            est_hours = 0.0
+            total_sessions = 0
+            for feat in udf["feature"].unique():
+                uf_feat = udf[udf["feature"] == feat]
+                s_count, s_hours = self._compute_sessions(uf_feat["ts"], interval_min)
+                est_hours += s_hours
+                total_sessions += s_count
+            est_hours = round(est_hours, 1)
+
+            avg_hours_day = round(est_hours / period_days, 1)
+            avg_hours_day_copy = round(avg_hours_day / features_used, 1) if features_used > 0 else 0.0
+            avg_session_hrs = round(est_hours / total_sessions, 2) if total_sessions > 0 else 0.0
             results.append({
                 "user": user,
                 "company": company,
@@ -1905,6 +2017,9 @@ class LicenseMonitorGUI(QMainWindow):
                 "first_active": first_active,
                 "last_active": last_active,
                 "avg_hours_day": avg_hours_day,
+                "avg_hours_day_copy": avg_hours_day_copy,
+                "sessions": total_sessions,
+                "avg_session_hrs": avg_session_hrs,
             })
         return sorted(results, key=lambda r: r["est_usage_hours"], reverse=True)
 
@@ -1931,7 +2046,7 @@ class LicenseMonitorGUI(QMainWindow):
             parts.append("""<table>
 <tr><th>Feature</th><th>Total Checkouts</th><th>Unique Users</th>
 <th>Active Days</th><th>Avg Concurrent</th><th>Peak Concurrent</th>
-<th>Est. Usage Hours</th><th>First Seen</th><th>Last Seen</th>
+<th>Usage Hours</th><th>First Seen</th><th>Last Seen</th>
 <th>Policy Max</th><th>Utilization</th><th>Hours Util. %</th></tr>""")
             for s in stat_rows:
                 pm = str(s["policy_max"]) if s["policy_max"] is not None else "-"
@@ -2002,7 +2117,7 @@ class LicenseMonitorGUI(QMainWindow):
             parts.append("""<h2>Top Users by Checkout Volume</h2>
 <table>
 <tr><th>#</th><th>User</th><th>Company</th><th>Features Used</th>
-<th>Total Checkouts</th><th>Est. Usage Hours</th><th>Active Days</th>
+<th>Total Checkouts</th><th>Usage Hours</th><th>Active Days</th>
 <th>First Active</th><th>Last Active</th></tr>""")
             for i, u in enumerate(user_rows, 1):
                 parts.append(
@@ -2120,7 +2235,7 @@ class LicenseMonitorGUI(QMainWindow):
         h.append("""<h2>Company Breakdown</h2>
 <table>
 <tr><th>Company</th><th>Features Used</th><th>Total Checkouts</th>
-<th>Unique Users</th><th>Peak Concurrent</th><th>Est. Usage Hours</th></tr>""")
+<th>Unique Users</th><th>Peak Concurrent</th><th>Usage Hours</th></tr>""")
         for c in company_breakdown:
             h.append(
                 f'<tr><td>{c["company"]}</td><td>{c["features_used"]}</td>'
@@ -2160,15 +2275,19 @@ class LicenseMonitorGUI(QMainWindow):
             h.append("""<h2>User Activity</h2>
 <table>
 <tr><th>User</th><th>Company</th><th>Features Used</th><th>Total Checkouts</th>
-<th>Est. Usage Hours</th><th>Active Days</th><th>First Active</th>
-<th>Last Active</th><th>Avg Hours/Day</th></tr>""")
+<th>Usage Hours</th><th>Active Days</th><th>First Active</th>
+<th>Last Active</th><th>Avg Hrs/Day</th><th>Avg Hrs/Day/Copy</th>
+<th>Sessions</th><th>Avg Session Hrs</th></tr>""")
             for ua in user_activity:
                 h.append(
                     f'<tr><td>{ua["user"]}</td><td>{ua["company"]}</td>'
                     f'<td>{ua["features_used"]}</td><td>{ua["total_checkouts"]:,}</td>'
                     f'<td>{ua["est_usage_hours"]}</td><td>{ua["active_days"]}</td>'
                     f'<td>{ua["first_active"]}</td><td>{ua["last_active"]}</td>'
-                    f'<td>{ua["avg_hours_day"]}</td></tr>'
+                    f'<td>{ua["avg_hours_day"]}</td>'
+                    f'<td>{ua.get("avg_hours_day_copy", 0.0)}</td>'
+                    f'<td>{ua.get("sessions", 0)}</td>'
+                    f'<td>{ua.get("avg_session_hrs", 0.0)}</td></tr>'
                 )
             h.append("</table>")
 
