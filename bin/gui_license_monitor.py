@@ -838,6 +838,12 @@ class LicenseMonitorGUI(QMainWindow):
     def _load_policy(self):
         self.policy_rows = PolicyLoader.load(DB_PATH)
         self.user_company_map = {user: company for user, company, _, _ in self.policy_rows}
+        # Build company → features and company → users mappings from policy
+        self.company_features_map = {}  # {company: set(features)}
+        self.company_users_map = {}     # {company: set(users)}
+        for user, company, feature, _ in self.policy_rows:
+            self.company_features_map.setdefault(company, set()).add(feature)
+            self.company_users_map.setdefault(company, set()).add(user)
 
     def _compute_policy_map(self, selected_users=None):
         """Compute {feature: SUM(policy_max)} filtered by selected users."""
@@ -1191,35 +1197,43 @@ class LicenseMonitorGUI(QMainWindow):
             self._apply_and_refresh()
 
     def _on_company_filter_changed(self):
-        """When company selection changes, update user list to show only related users."""
+        """When company selection changes, auto-select related users and features from policy."""
         if self.raw_data is None or self.raw_data.empty:
             return
 
         sel_companies = self._get_selected(self.company_list)
 
-        # Filter users to those belonging to selected companies
+        # --- Auto-select users for selected companies ---
+        # Merge users from data + policy for the selected companies
+        data_users = set()
+        policy_users = set()
         if sel_companies:
-            related_users = sorted(
+            data_users = set(
                 self.raw_data[self.raw_data["company"].isin(sel_companies)]["user"].unique()
             )
-        else:
-            related_users = []
-
-        # Preserve currently selected users that still exist in the new list
-        prev_selected = set(self._get_selected(self.user_list))
+            for comp in sel_companies:
+                policy_users |= self.company_users_map.get(comp, set())
+        related_users = sorted(data_users | policy_users)
 
         self.user_list.blockSignals(True)
         self.user_list.clear()
         for usr in related_users:
             item = QListWidgetItem(usr)
             self.user_list.addItem(item)
-            # Select if previously selected, or select all if none were previously selected
-            item.setSelected(usr in prev_selected if prev_selected else True)
-        # If nothing ended up selected, select all
-        if not self.user_list.selectedItems() and self.user_list.count() > 0:
-            for i in range(self.user_list.count()):
-                self.user_list.item(i).setSelected(True)
+            item.setSelected(True)
         self.user_list.blockSignals(False)
+
+        # --- Auto-select features for selected companies ---
+        # Collect features from policy for selected companies
+        policy_features = set()
+        for comp in sel_companies:
+            policy_features |= self.company_features_map.get(comp, set())
+
+        self.feature_list.blockSignals(True)
+        for i in range(self.feature_list.count()):
+            item = self.feature_list.item(i)
+            item.setSelected(item.text() in policy_features)
+        self.feature_list.blockSignals(False)
 
         self._update_filter_labels()
         self._apply_and_refresh()
