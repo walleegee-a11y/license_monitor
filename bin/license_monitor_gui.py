@@ -433,7 +433,7 @@ class LicenseMonitorGUI(QMainWindow):
         self.stats_table.setColumnCount(8)
         self.stats_table.setHorizontalHeaderLabels([
             "Feature", "Total Snapshots", "Unique Users", "Active Days",
-            "Avg Concurrent", "Peak Concurrent", "Policy Max", "Utilization %"
+            "Avg When Active", "Peak Concurrent", "Policy Max", "Utilization %"
         ])
         tabs.addTab(self.stats_table, "📊 Statistics")
 

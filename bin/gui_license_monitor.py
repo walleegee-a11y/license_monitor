@@ -35,6 +35,7 @@ from PyQt5.QtGui import QColor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.dates import DateFormatter
+import matplotlib.dates as mdates
 
 import pandas as pd
 
@@ -360,13 +361,13 @@ class IngestThread(QThread):
 def determine_granularity(start_date, end_date):
     """Return (granularity_label, strftime_fmt, tick_format) based on period length."""
     delta = (end_date - start_date).days
-    if delta <= 2:
-        return "5min", "%Y-%m-%d %H:%M", "%H:%M"
-    elif delta <= 7:
-        return "hourly", "%Y-%m-%d %H:00", "%m-%d %H:00"
+    if delta <= 7:
+        return "5min", "%Y-%m-%d %H:%M", "%m-%d %H:%M"
     elif delta <= 31:
-        return "daily", "%Y-%m-%d", "%Y-%m-%d"
+        return "hourly", "%Y-%m-%d %H:00", "%m-%d %H:00"
     elif delta <= 93:
+        return "daily", "%Y-%m-%d", "%Y-%m-%d"
+    elif delta <= 365:
         return "weekly", None, "%G-W%V"   # special handling
     else:
         return "monthly", "%Y-%m", "%Y-%m"
@@ -385,7 +386,7 @@ def assign_time_bin(dt, granularity, bin_fmt):
         return dt.strftime(bin_fmt)
 
 
-def aggregate_by_time_bin(df, start_date, end_date):
+def aggregate_by_time_bin(df, start_date, end_date, override_granularity=None):
     """Group df by time bin and feature, counting concurrent licenses.
 
     Returns (aggregated_df, granularity_label, tick_format).
@@ -393,7 +394,18 @@ def aggregate_by_time_bin(df, start_date, end_date):
     if df.empty:
         return df, "daily", "%Y-%m-%d"
 
-    granularity, bin_fmt, tick_fmt = determine_granularity(start_date, end_date)
+    if override_granularity:
+        gran_formats = {
+            "5min": ("%Y-%m-%d %H:%M", "%m-%d %H:%M"),
+            "hourly": ("%Y-%m-%d %H:00", "%m-%d %H:00"),
+            "daily": ("%Y-%m-%d", "%Y-%m-%d"),
+            "weekly": (None, "%G-W%V"),
+            "monthly": ("%Y-%m", "%Y-%m"),
+        }
+        granularity = override_granularity
+        bin_fmt, tick_fmt = gran_formats.get(granularity, ("%Y-%m-%d", "%Y-%m-%d"))
+    else:
+        granularity, bin_fmt, tick_fmt = determine_granularity(start_date, end_date)
 
     df = df.copy()
     df["datetime"] = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
@@ -425,9 +437,16 @@ def aggregate_by_time_bin(df, start_date, end_date):
 
 
 def generate_all_time_bins(start_date, end_date, granularity, bin_fmt):
-    """Generate a complete list of time-bin strings covering [start_date, end_date]."""
+    """Generate a complete list of time-bin strings covering [start_date, end_date].
+
+    Stops at current time if end_date is today or in the future to prevent
+    chart area extending past 'Now'.
+    """
     start_dt = datetime(start_date.year, start_date.month, start_date.day)
-    end_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59)
+    end_of_day = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59)
+    now = datetime.now()
+    # Don't generate time bins beyond current time
+    end_dt = min(end_of_day, now)
 
     if granularity == "5min":
         idx = pd.date_range(start_dt, end_dt, freq="5min")
@@ -728,8 +747,8 @@ class LicenseMonitorGUI(QMainWindow):
         chart_opts = QHBoxLayout()
         chart_opts.addWidget(QLabel("Type:"))
         self.chart_type_cb = QComboBox()
-        self.chart_type_cb.addItems(["Line", "Bar", "Area", "Step"])
-        self.chart_type_cb.setCurrentIndex(2)  # Area
+        self.chart_type_cb.addItems(["Area", "Bar", "Line", "Step"])
+        self.chart_type_cb.setCurrentIndex(0)  # Area
         self.chart_type_cb.currentIndexChanged.connect(self._on_chart_option_changed)
         chart_opts.addWidget(self.chart_type_cb)
 
@@ -759,6 +778,12 @@ class LicenseMonitorGUI(QMainWindow):
         self.font_size_cb.currentIndexChanged.connect(self._on_chart_option_changed)
         chart_opts.addWidget(self.font_size_cb)
 
+        chart_opts.addWidget(QLabel("Scale:"))
+        self.granularity_cb = QComboBox()
+        self.granularity_cb.addItems(["Auto", "5min", "Hourly", "Daily", "Weekly", "Monthly"])
+        self.granularity_cb.currentIndexChanged.connect(self._on_chart_option_changed)
+        chart_opts.addWidget(self.granularity_cb)
+
         chart_opts.addWidget(QLabel("Grid:"))
         self.grid_cb = QComboBox()
         self.grid_cb.addItems(["On", "Off"])
@@ -785,11 +810,22 @@ class LicenseMonitorGUI(QMainWindow):
         self.stats_table.setColumnCount(12)
         self.stats_table.setHorizontalHeaderLabels([
             "Feature", "Total Checkouts", "Unique Users", "Active Days",
-            "Avg Concurrent", "Peak Concurrent", "Usage Hours",
+            "Avg When Active", "Peak Concurrent", "Usage Hours",
             "First Seen", "Last Seen",
-            "Policy Max", "Utilization", "Hours Util. %",
+            "Policy Max", "Active Util. %", "Period Util. %",
         ])
-        self.stats_table.horizontalHeader().setStretchLastSection(True)
+        # Add tooltips to explain metrics
+        header = self.stats_table.horizontalHeader()
+        self.stats_table.horizontalHeaderItem(4).setToolTip(
+            "Average concurrent licenses during active snapshots only\n"
+            "(excludes zero-usage periods)")
+        self.stats_table.horizontalHeaderItem(10).setToolTip(
+            "Avg When Active / Policy Max × 100%\n"
+            "Shows how much of the policy limit is used when feature is active")
+        self.stats_table.horizontalHeaderItem(11).setToolTip(
+            "Usage Hours / (Policy Max × Period Hours) × 100%\n"
+            "Overall utilization across the entire time period")
+        header.setStretchLastSection(True)
         self.stats_table.setSortingEnabled(True)
         self.tabs.addTab(self.stats_table, "Statistics")
 
@@ -1296,7 +1332,23 @@ class LicenseMonitorGUI(QMainWindow):
         start_d = date(start_qd.year(), start_qd.month(), start_qd.day())
         end_d = date(end_qd.year(), end_qd.month(), end_qd.day())
 
-        agg, granularity, tick_fmt = aggregate_by_time_bin(df, start_d, end_d)
+        # Check if user selected a specific granularity or Auto
+        user_gran = self.granularity_cb.currentText()
+        if user_gran == "Auto":
+            agg, granularity, tick_fmt = aggregate_by_time_bin(df, start_d, end_d)
+        else:
+            # Map user selection to granularity
+            display_to_gran = {
+                "5min": "5min", "Hourly": "hourly", "Daily": "daily",
+                "Weekly": "weekly", "Monthly": "monthly"
+            }
+            gran_formats = {
+                "5min": "%m-%d %H:%M", "hourly": "%m-%d %H:00",
+                "daily": "%Y-%m-%d", "weekly": "%G-W%V", "monthly": "%Y-%m"
+            }
+            granularity = display_to_gran.get(user_gran, "daily")
+            tick_fmt = gran_formats.get(granularity, "%Y-%m-%d")
+            agg, _, _ = aggregate_by_time_bin(df, start_d, end_d, override_granularity=granularity)
 
         if agg.empty:
             ax.text(0.5, 0.5, "No data after aggregation", ha="center", va="center",
@@ -1305,7 +1357,14 @@ class LicenseMonitorGUI(QMainWindow):
             return
 
         # Fill missing time bins with zero
-        _, bin_fmt, _ = determine_granularity(start_d, end_d)
+        gran_bin_fmt = {
+            "5min": "%Y-%m-%d %H:%M",
+            "hourly": "%Y-%m-%d %H:00",
+            "daily": "%Y-%m-%d",
+            "weekly": None,
+            "monthly": "%Y-%m",
+        }
+        bin_fmt = gran_bin_fmt.get(granularity)
         agg = fill_missing_time_bins(agg, start_d, end_d, granularity, bin_fmt)
 
         # Convert time_bin back to datetime for plotting
@@ -1330,13 +1389,23 @@ class LicenseMonitorGUI(QMainWindow):
         features = sorted(agg["feature"].unique())
         feat_colors = {}
 
+        # Calculate period span in days for bar width scaling
+        period_days = (end_d - start_d).days + 1
+
         if ct == "bar":
             n_feat = max(len(features), 1)
-            width_days = {
-                "5min": 1 / 288, "hourly": 1 / 24, "daily": 1,
-                "weekly": 7, "monthly": 28,
+            # Calculate bar width based on granularity and period span
+            # Width should be proportional to the time unit, scaled for visibility
+            granularity_days = {
+                "5min": 5 / 1440,      # 5 minutes in days
+                "hourly": 1 / 24,      # 1 hour in days
+                "daily": 1,            # 1 day
+                "weekly": 7,           # 7 days
+                "monthly": 30,         # ~30 days
             }
-            base_w = width_days.get(granularity, 1) * 0.8
+            unit_days = granularity_days.get(granularity, 1)
+            # Scale bar width: 80% of unit width, divided by number of features
+            base_w = unit_days * 0.8
             bar_w = base_w / n_feat
             for i, feat in enumerate(features):
                 fdata = agg[agg["feature"] == feat].sort_values("plot_dt")
@@ -1366,18 +1435,6 @@ class LicenseMonitorGUI(QMainWindow):
                                     drawstyle="steps-post")
                 feat_colors[feat] = line.get_color()
 
-                # Annotate transition points (where value changes)
-                y_vals = y.values if hasattr(y, 'values') else list(y)
-                x_vals = x.values if hasattr(x, 'values') else list(x)
-                for j in range(len(y_vals)):
-                    if j == 0 or y_vals[j] != y_vals[j - 1]:
-                        val = int(y_vals[j])
-                        if val > 0:
-                            ax.annotate(str(val), (x_vals[j], y_vals[j]),
-                                        textcoords="offset points", xytext=(0, 6),
-                                        fontsize=max(fs - 3, 5), ha="center",
-                                        color=feat_colors.get(feat, "black"))
-
         # Policy overlay — same color as its feature, or default for zero-usage
         for feat in self.policy_map:
             color = feat_colors.get(feat, None)
@@ -1393,6 +1450,18 @@ class LicenseMonitorGUI(QMainWindow):
                     xytext=(4, -2), textcoords="offset points",
                     fontsize=fs - 1, color="red", fontweight="bold",
                     va="top")
+
+        # Add 0.1x padding based on period span
+        start_num = mdates.date2num(datetime.combine(start_d, datetime.min.time()))
+        end_num = mdates.date2num(datetime.combine(end_d, datetime.max.time()))
+        period_span = end_num - start_num
+        pad = period_span * 0.1  # 0.1x of total period
+
+        # Set x-axis limits: full period with 0.1x padding on each side
+        left_limit = start_num - pad
+        right_limit = end_num + pad
+
+        ax.set_xlim(left=left_limit, right=right_limit)
 
         # Axis formatting
         ax.set_ylabel("Concurrent Licenses", fontsize=fs + 1, fontweight="bold")
@@ -1525,7 +1594,6 @@ class LicenseMonitorGUI(QMainWindow):
 
         interval_min = self._snapshot_interval_minutes()
         period_hours = self._get_period_hours()
-        total_snapshots = df["ts"].nunique() if not df.empty else 0
 
         for row_idx, feat in enumerate(all_features):
             if not df.empty and feat in data_features:
@@ -1535,7 +1603,6 @@ class LicenseMonitorGUI(QMainWindow):
                 active_days = fdf["datetime"].dt.date.nunique()
 
                 concurrent_per_snap = fdf.groupby("ts").size()
-                avg_concurrent = float(round(concurrent_per_snap.sum() / total_snapshots, 2)) if total_snapshots > 0 else 0
                 peak_concurrent = int(concurrent_per_snap.max()) if not concurrent_per_snap.empty else 0
 
                 est_usage_hours = 0.0
@@ -1543,6 +1610,9 @@ class LicenseMonitorGUI(QMainWindow):
                     _, usr_hrs = self._compute_sessions(fdf[fdf["user"] == usr]["ts"], interval_min)
                     est_usage_hours += usr_hrs
                 est_usage_hours = round(est_usage_hours, 2)
+
+                # Avg concurrent when feature is actively checked out (used for display and Active Util. %)
+                avg_concurrent = float(round(concurrent_per_snap.mean(), 2)) if not concurrent_per_snap.empty else 0
 
                 valid_dt = fdf["datetime"].dropna()
                 first_seen = str(valid_dt.min()) if not valid_dt.empty else "-"
@@ -1573,33 +1643,34 @@ class LicenseMonitorGUI(QMainWindow):
 
             if policy_max is not None:
                 self.stats_table.setItem(row_idx, 9, self._make_numeric_item(policy_max))
-                if policy_max > 0:
-                    util_pct = avg_concurrent / policy_max * 100
-                else:
-                    util_pct = 0
-                util_item = QTableWidgetItem(f"{util_pct:.1f}%")
-                if util_pct >= 80:
-                    util_item.setBackground(QColor(144, 238, 144))  # green
-                elif util_pct >= 30:
-                    util_item.setBackground(QColor(255, 255, 153))  # yellow
-                else:
-                    util_item.setBackground(QColor(255, 182, 182))  # red
-                self.stats_table.setItem(row_idx, 10, util_item)
 
-                # Hours Util. % = est_usage_hours / (policy_max × period_hours) × 100
+                # Active Util. % = avg concurrent when in use / policy_max
+                if policy_max > 0:
+                    active_util = avg_concurrent / policy_max * 100
+                else:
+                    active_util = 0
+                au_item = QTableWidgetItem(f"{active_util:.1f}%")
+                if active_util >= 80:
+                    au_item.setBackground(QColor(144, 238, 144))  # green
+                elif active_util >= 30:
+                    au_item.setBackground(QColor(255, 255, 153))  # yellow
+                else:
+                    au_item.setBackground(QColor(255, 182, 182))  # red
+                self.stats_table.setItem(row_idx, 10, au_item)
+
+                # Period Util. % = usage_hours / (policy_max × period_hours) × 100
                 if policy_max > 0 and period_hours > 0:
-                    capacity_hours = policy_max * period_hours
-                    hours_util = est_usage_hours / capacity_hours * 100
+                    period_util = est_usage_hours / (policy_max * period_hours) * 100
                 else:
-                    hours_util = 0
-                hu_item = QTableWidgetItem(f"{hours_util:.1f}%")
-                if hours_util >= 60:
-                    hu_item.setBackground(QColor(144, 238, 144))  # green
-                elif hours_util >= 20:
-                    hu_item.setBackground(QColor(255, 255, 153))  # yellow
+                    period_util = 0
+                pu_item = QTableWidgetItem(f"{period_util:.1f}%")
+                if period_util >= 60:
+                    pu_item.setBackground(QColor(144, 238, 144))  # green
+                elif period_util >= 20:
+                    pu_item.setBackground(QColor(255, 255, 153))  # yellow
                 else:
-                    hu_item.setBackground(QColor(255, 182, 182))  # red
-                self.stats_table.setItem(row_idx, 11, hu_item)
+                    pu_item.setBackground(QColor(255, 182, 182))  # red
+                self.stats_table.setItem(row_idx, 11, pu_item)
             else:
                 self.stats_table.setItem(row_idx, 9, QTableWidgetItem("-"))
                 no_policy = QTableWidgetItem("No policy")
@@ -1805,6 +1876,15 @@ class LicenseMonitorGUI(QMainWindow):
                 ax.xaxis.set_major_formatter(DateFormatter(tick_fmt))
                 fig.autofmt_xdate(rotation=45)
 
+                # Clip x-axis to not extend beyond "Now" (prevents chart area past current time)
+                now_dt = datetime.now()
+                xlim = ax.get_xlim()
+                now_num = mdates.date2num(now_dt)
+                margin = (xlim[1] - xlim[0]) * 0.015  # 1.5% margin past Now for breathing room
+                # Only clip right edge to Now + small margin, don't touch left
+                if xlim[1] > now_num + margin:
+                    ax.set_xlim(right=now_num + margin)
+
                 gran_labels = {
                     "5min": "5-Minute", "hourly": "Hourly", "daily": "Daily",
                     "weekly": "Weekly", "monthly": "Monthly",
@@ -1841,7 +1921,6 @@ class LicenseMonitorGUI(QMainWindow):
         df["datetime"] = pd.to_datetime(df["ts"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
         interval_min = self._snapshot_interval_minutes()
         ph = period_hours if period_hours else 1.0
-        total_snapshots = df["ts"].nunique()
         rows = []
         for feat in sorted(df["feature"].unique()):
             fdf = df[df["feature"] == feat]
@@ -1849,8 +1928,6 @@ class LicenseMonitorGUI(QMainWindow):
             unique_users = fdf["user"].nunique()
             active_days = fdf["datetime"].dt.date.nunique()
             concurrent_per_snap = fdf.groupby("ts").size()
-            # Divide by ALL snapshots (not just ones where this feature appears)
-            avg_conc = round(float(concurrent_per_snap.sum() / total_snapshots), 2) if total_snapshots > 0 else 0
             peak_conc = int(concurrent_per_snap.max()) if not concurrent_per_snap.empty else 0
             # Usage Hours: sum of per-user session durations for this feature
             est_usage_hours = 0.0
@@ -1858,15 +1935,19 @@ class LicenseMonitorGUI(QMainWindow):
                 _, usr_hrs = self._compute_sessions(fdf[fdf["user"] == usr]["ts"], interval_min)
                 est_usage_hours += usr_hrs
             est_usage_hours = round(est_usage_hours, 1)
+            # Time-weighted avg concurrent over entire period
+            avg_conc = round(est_usage_hours / ph, 2) if ph > 0 else 0
+            # Avg concurrent when feature is actively checked out
+            avg_conc_active = round(float(concurrent_per_snap.mean()), 2) if not concurrent_per_snap.empty else 0
             valid_dt = fdf["datetime"].dropna()
             first_seen = str(valid_dt.min()) if not valid_dt.empty else "-"
             last_seen = str(valid_dt.max()) if not valid_dt.empty else "-"
             policy_max = pmap.get(feat)
-            util_pct = None
-            hours_util = None
+            active_util = None
+            period_util = None
             if policy_max and policy_max > 0:
-                util_pct = round(avg_conc / policy_max * 100, 1)
-                hours_util = round(est_usage_hours / (policy_max * ph) * 100, 1)
+                active_util = round(avg_conc_active / policy_max * 100, 1)
+                period_util = round(est_usage_hours / (policy_max * ph) * 100, 1)
             rows.append({
                 "feature": feat,
                 "total_checkouts": total_checkouts,
@@ -1878,8 +1959,8 @@ class LicenseMonitorGUI(QMainWindow):
                 "first_seen": first_seen,
                 "last_seen": last_seen,
                 "policy_max": policy_max,
-                "utilization": util_pct,
-                "hours_utilization": hours_util,
+                "active_utilization": active_util,
+                "period_utilization": period_util,
             })
         return rows
 
@@ -2098,33 +2179,34 @@ class LicenseMonitorGUI(QMainWindow):
             parts = []
             parts.append("""<table>
 <tr><th>Feature</th><th>Total Checkouts</th><th>Unique Users</th>
-<th>Active Days</th><th>Avg Concurrent</th><th>Peak Concurrent</th>
+<th>Active Days</th><th>Avg When Active</th><th>Peak Concurrent</th>
 <th>Usage Hours</th><th>First Seen</th><th>Last Seen</th>
-<th>Policy Max</th><th>Utilization</th><th>Hours Util. %</th></tr>""")
+<th>Policy Max</th><th>Active Util. %</th><th>Period Util. %</th></tr>""")
             for s in stat_rows:
                 pm = str(s["policy_max"]) if s["policy_max"] is not None else "-"
                 euh = s.get("est_usage_hours", 0.0)
                 fs = s.get("first_seen", "-")
                 ls = s.get("last_seen", "-")
-                if s["utilization"] is not None:
-                    uc = util_color(s["utilization"])
-                    util_cell = (f'<td><span class="util-cell" style="background:{uc};">'
-                                 f'{s["utilization"]:.1f}%</span></td>')
+                au = s.get("active_utilization")
+                if au is not None:
+                    auc = util_color(au)
+                    au_cell = (f'<td><span class="util-cell" style="background:{auc};">'
+                               f'{au:.1f}%</span></td>')
                 else:
-                    util_cell = '<td><span class="util-cell" style="background:#dcdcdc;">N/A</span></td>'
-                hu = s.get("hours_utilization")
-                if hu is not None:
-                    huc = util_color(hu * 4 / 3)  # scale: 60%→green, 20%→yellow
-                    hu_cell = (f'<td><span class="util-cell" style="background:{huc};">'
-                               f'{hu:.1f}%</span></td>')
+                    au_cell = '<td><span class="util-cell" style="background:#dcdcdc;">N/A</span></td>'
+                pu = s.get("period_utilization")
+                if pu is not None:
+                    puc = util_color(pu * 4 / 3)  # scale: 60%→green, 20%→yellow
+                    pu_cell = (f'<td><span class="util-cell" style="background:{puc};">'
+                               f'{pu:.1f}%</span></td>')
                 else:
-                    hu_cell = '<td><span class="util-cell" style="background:#dcdcdc;">N/A</span></td>'
+                    pu_cell = '<td><span class="util-cell" style="background:#dcdcdc;">N/A</span></td>'
                 parts.append(
                     f'<tr><td>{s["feature"]}</td><td>{s["total_checkouts"]:,}</td>'
                     f'<td>{s["unique_users"]}</td><td>{s["active_days"]}</td>'
                     f'<td>{s["avg_concurrent"]}</td><td>{s["peak_concurrent"]}</td>'
                     f'<td>{euh}</td><td>{fs}</td><td>{ls}</td>'
-                    f'<td>{pm}</td>{util_cell}{hu_cell}</tr>'
+                    f'<td>{pm}</td>{au_cell}{pu_cell}</tr>'
                 )
             parts.append("</table>")
             return "\n".join(parts)
