@@ -1,11 +1,15 @@
-GROUP CIRCLE_PT circle-blue circle-pink circle-cyan
-GROUP PEBBLESQUARE_Verdi pebblesqare-stone
+GROUP CIRCLE_PT circle-blue circle-pink circle-cyan scott-nice sally-cute
+GROUP PEBBLESQUARE_Verdi pebblesquare-stone
+GROUP ETTIFOS_Verdi ettifos-zeno
 
 EXCLUDE PrimeTime ALL
-EXCLUDE Verdi
+EXCLUDE Verdi ALL
 
 INCLUDE PrimeTime GROUP CIRCLE_PT
 MAX 2 PrimeTime GROUP CIRCLE_PT
 
 INCLUDE Verdi GROUP PEBBLESQUARE_Verdi
-MAX 2 Verdi GROUP PEBBLESQUARE_Verdi
+MAX 1 Verdi GROUP PEBBLESQUARE_Verdi
+
+INCLUDE Verdi GROUP ETTIFOS_Verdi
+MAX 1 Verdi GROUP ETTIFOS_Verdi

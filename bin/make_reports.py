@@ -45,7 +45,8 @@ CSV_HEADER = [
     "avg_concurrent",
     "peak_concurrent",
     "policy_max",
-    "utilization_pct",
+    "active_utilization_pct",
+    "period_utilization_pct",
     "utilization_status",
 ]
 
@@ -90,7 +91,8 @@ for period_name, view_name in PERIODS:
           avg_concurrent,
           peak_concurrent,
           policy_max,
-          utilization_pct,
+          active_utilization_pct,
+          period_utilization_pct,
           utilization_status
         FROM {view_name}
         ORDER BY company, feature;
@@ -128,7 +130,7 @@ for period_name, view_name in PERIODS:
                 usage_count, active_users, active_snapshots,
                 usage_minutes, usage_hours, usage_ratio,
                 avg_concurrent, peak_concurrent, policy_max,
-                utilization_pct, status
+                active_utilization_pct, period_utilization_pct, status
             ) = r
 
             f.write(
@@ -136,7 +138,8 @@ for period_name, view_name in PERIODS:
                 f"avg_concurrent={avg_concurrent}, "
                 f"peak_concurrent={peak_concurrent}, "
                 f"policy_max={policy_max}, "
-                f"utilization_pct={utilization_pct}%, "
+                f"active_util={active_utilization_pct}%, "
+                f"period_util={period_utilization_pct}%, "
                 f"status={status}\n"
             )
 
@@ -145,14 +148,15 @@ for period_name, view_name in PERIODS:
         f.write("- **usage_count**: Number of snapshots with active checkout\n")
         f.write("- **active_users**: Distinct users in the period\n")
         f.write("- **active_snapshots**: Time slices with activity\n")
-        f.write("- **avg_concurrent**: usage_count / active_snapshots\n")
+        f.write("- **avg_concurrent**: time-weighted average = usage_hours / period_hours\n")
         f.write("- **peak_concurrent**: MAX simultaneous checkouts at any single snapshot\n")
         f.write("- **policy_max**: MAX copy from options.opt\n")
-        f.write("- **utilization_pct**: avg_concurrent / policy_max * 100 (NULL when no policy)\n")
-        f.write("- **utilization_status**:\n")
-        f.write("  - EFFECTIVE_USE: ≥ 80% of allocation\n")
-        f.write("  - PARTIAL_USE: 30–80% of allocation\n")
-        f.write("  - UNDERUTILIZED: < 30% of allocation\n")
+        f.write("- **active_utilization_pct**: (avg concurrent when in use) / policy_max * 100\n")
+        f.write("- **period_utilization_pct**: usage_hours / (policy_max * period_hours) * 100\n")
+        f.write("- **utilization_status** (based on period_utilization_pct):\n")
+        f.write("  - EFFECTIVE_USE: ≥ 60% of capacity\n")
+        f.write("  - PARTIAL_USE: 20–60% of capacity\n")
+        f.write("  - UNDERUTILIZED: < 20% of capacity\n")
         f.write("  - NO_POLICY: no MAX rule defined\n")
 
     index_rows.append((period_name, csv_path.replace(BASE, "")))

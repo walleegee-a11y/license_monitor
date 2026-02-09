@@ -221,22 +221,26 @@ DROP VIEW IF EXISTS v_usage_weekly_ext;
 CREATE VIEW v_usage_weekly_ext AS
 SELECT
   w.*,
-  ROUND(
-    CAST(w.usage_count AS REAL) / NULLIF(w.active_snapshots,0),
-    2
-  ) AS avg_concurrent,
+  -- Time-weighted avg concurrent = usage_hours / period_hours (168h per week)
+  ROUND(w.usage_hours / 168.0, 2) AS avg_concurrent,
   pk.peak_concurrent,
   p.policy_max,
+  -- Active Util %: avg concurrent when in use / policy_max
   ROUND(
     CAST(w.usage_count AS REAL) / NULLIF(w.active_snapshots,0)
     / NULLIF(p.policy_max, 0) * 100,
     1
-  ) AS utilization_pct,
+  ) AS active_utilization_pct,
+  -- Period Util %: usage_hours / (policy_max * period_hours)
+  ROUND(
+    w.usage_hours / (NULLIF(p.policy_max, 0) * 168.0) * 100,
+    1
+  ) AS period_utilization_pct,
   CASE
     WHEN p.policy_max IS NULL THEN 'NO_POLICY'
-    WHEN (CAST(w.usage_count AS REAL) / NULLIF(w.active_snapshots,0)) >= p.policy_max * 0.8
+    WHEN w.usage_hours / (NULLIF(p.policy_max, 0) * 168.0) >= 0.6
          THEN 'EFFECTIVE_USE'
-    WHEN (CAST(w.usage_count AS REAL) / NULLIF(w.active_snapshots,0)) >= p.policy_max * 0.3
+    WHEN w.usage_hours / (NULLIF(p.policy_max, 0) * 168.0) >= 0.2
          THEN 'PARTIAL_USE'
     ELSE 'UNDERUTILIZED'
   END AS utilization_status
@@ -256,23 +260,38 @@ DROP VIEW IF EXISTS v_usage_monthly_ext;
 CREATE VIEW v_usage_monthly_ext AS
 SELECT
   m.*,
+  -- Time-weighted avg concurrent = usage_hours / period_hours
   ROUND(
-    CAST(m.usage_count AS REAL) / NULLIF(m.active_snapshots,0),
+    m.usage_hours /
+    ((julianday(m.period || '-01', '+1 month') - julianday(m.period || '-01')) * 24.0),
     2
   ) AS avg_concurrent,
   pk.peak_concurrent,
   p.policy_max,
+  -- Active Util %: avg concurrent when in use / policy_max
   ROUND(
     CAST(m.usage_count AS REAL) / NULLIF(m.active_snapshots,0)
     / NULLIF(p.policy_max, 0) * 100,
     1
-  ) AS utilization_pct,
+  ) AS active_utilization_pct,
+  -- Period Util %: usage_hours / (policy_max * period_hours)
+  ROUND(
+    m.usage_hours /
+    (NULLIF(p.policy_max, 0) *
+     (julianday(m.period || '-01', '+1 month') - julianday(m.period || '-01')) * 24.0)
+    * 100,
+    1
+  ) AS period_utilization_pct,
   CASE
     WHEN p.policy_max IS NULL THEN 'NO_POLICY'
-    WHEN (CAST(m.usage_count AS REAL) / NULLIF(m.active_snapshots,0)) >= p.policy_max * 0.8
-         THEN 'EFFECTIVE_USE'
-    WHEN (CAST(m.usage_count AS REAL) / NULLIF(m.active_snapshots,0)) >= p.policy_max * 0.3
-         THEN 'PARTIAL_USE'
+    WHEN m.usage_hours /
+         (NULLIF(p.policy_max, 0) *
+          (julianday(m.period || '-01', '+1 month') - julianday(m.period || '-01')) * 24.0)
+         >= 0.6 THEN 'EFFECTIVE_USE'
+    WHEN m.usage_hours /
+         (NULLIF(p.policy_max, 0) *
+          (julianday(m.period || '-01', '+1 month') - julianday(m.period || '-01')) * 24.0)
+         >= 0.2 THEN 'PARTIAL_USE'
     ELSE 'UNDERUTILIZED'
   END AS utilization_status
 FROM v_usage_monthly m
@@ -291,23 +310,87 @@ DROP VIEW IF EXISTS v_usage_quarterly_ext;
 CREATE VIEW v_usage_quarterly_ext AS
 SELECT
   q.*,
+  -- Time-weighted avg concurrent = usage_hours / period_hours
+  -- Quarter start: map Q1→01, Q2→04, Q3→07, Q4→10
   ROUND(
-    CAST(q.usage_count AS REAL) / NULLIF(q.active_snapshots,0),
+    q.usage_hours /
+    ((julianday(
+        substr(q.period,1,4) || '-' ||
+        CASE substr(q.period,7,1)
+          WHEN '1' THEN '01' WHEN '2' THEN '04'
+          WHEN '3' THEN '07' WHEN '4' THEN '10'
+        END || '-01', '+3 months')
+      - julianday(
+        substr(q.period,1,4) || '-' ||
+        CASE substr(q.period,7,1)
+          WHEN '1' THEN '01' WHEN '2' THEN '04'
+          WHEN '3' THEN '07' WHEN '4' THEN '10'
+        END || '-01')
+    ) * 24.0),
     2
   ) AS avg_concurrent,
   pk.peak_concurrent,
   p.policy_max,
+  -- Active Util %: avg concurrent when in use / policy_max
   ROUND(
     CAST(q.usage_count AS REAL) / NULLIF(q.active_snapshots,0)
     / NULLIF(p.policy_max, 0) * 100,
     1
-  ) AS utilization_pct,
+  ) AS active_utilization_pct,
+  -- Period Util %: usage_hours / (policy_max * period_hours)
+  ROUND(
+    q.usage_hours /
+    (NULLIF(p.policy_max, 0) *
+     (julianday(
+        substr(q.period,1,4) || '-' ||
+        CASE substr(q.period,7,1)
+          WHEN '1' THEN '01' WHEN '2' THEN '04'
+          WHEN '3' THEN '07' WHEN '4' THEN '10'
+        END || '-01', '+3 months')
+      - julianday(
+        substr(q.period,1,4) || '-' ||
+        CASE substr(q.period,7,1)
+          WHEN '1' THEN '01' WHEN '2' THEN '04'
+          WHEN '3' THEN '07' WHEN '4' THEN '10'
+        END || '-01')
+     ) * 24.0)
+    * 100,
+    1
+  ) AS period_utilization_pct,
   CASE
     WHEN p.policy_max IS NULL THEN 'NO_POLICY'
-    WHEN (CAST(q.usage_count AS REAL) / NULLIF(q.active_snapshots,0)) >= p.policy_max * 0.8
-         THEN 'EFFECTIVE_USE'
-    WHEN (CAST(q.usage_count AS REAL) / NULLIF(q.active_snapshots,0)) >= p.policy_max * 0.3
-         THEN 'PARTIAL_USE'
+    WHEN q.usage_hours /
+         (NULLIF(p.policy_max, 0) *
+          (julianday(
+             substr(q.period,1,4) || '-' ||
+             CASE substr(q.period,7,1)
+               WHEN '1' THEN '01' WHEN '2' THEN '04'
+               WHEN '3' THEN '07' WHEN '4' THEN '10'
+             END || '-01', '+3 months')
+           - julianday(
+             substr(q.period,1,4) || '-' ||
+             CASE substr(q.period,7,1)
+               WHEN '1' THEN '01' WHEN '2' THEN '04'
+               WHEN '3' THEN '07' WHEN '4' THEN '10'
+             END || '-01')
+          ) * 24.0)
+         >= 0.6 THEN 'EFFECTIVE_USE'
+    WHEN q.usage_hours /
+         (NULLIF(p.policy_max, 0) *
+          (julianday(
+             substr(q.period,1,4) || '-' ||
+             CASE substr(q.period,7,1)
+               WHEN '1' THEN '01' WHEN '2' THEN '04'
+               WHEN '3' THEN '07' WHEN '4' THEN '10'
+             END || '-01', '+3 months')
+           - julianday(
+             substr(q.period,1,4) || '-' ||
+             CASE substr(q.period,7,1)
+               WHEN '1' THEN '01' WHEN '2' THEN '04'
+               WHEN '3' THEN '07' WHEN '4' THEN '10'
+             END || '-01')
+          ) * 24.0)
+         >= 0.2 THEN 'PARTIAL_USE'
     ELSE 'UNDERUTILIZED'
   END AS utilization_status
 FROM v_usage_quarterly q
@@ -326,23 +409,38 @@ DROP VIEW IF EXISTS v_usage_yearly_ext;
 CREATE VIEW v_usage_yearly_ext AS
 SELECT
   y.*,
+  -- Time-weighted avg concurrent = usage_hours / period_hours
   ROUND(
-    CAST(y.usage_count AS REAL) / NULLIF(y.active_snapshots,0),
+    y.usage_hours /
+    ((julianday(y.period || '-01-01', '+1 year') - julianday(y.period || '-01-01')) * 24.0),
     2
   ) AS avg_concurrent,
   pk.peak_concurrent,
   p.policy_max,
+  -- Active Util %: avg concurrent when in use / policy_max
   ROUND(
     CAST(y.usage_count AS REAL) / NULLIF(y.active_snapshots,0)
     / NULLIF(p.policy_max, 0) * 100,
     1
-  ) AS utilization_pct,
+  ) AS active_utilization_pct,
+  -- Period Util %: usage_hours / (policy_max * period_hours)
+  ROUND(
+    y.usage_hours /
+    (NULLIF(p.policy_max, 0) *
+     (julianday(y.period || '-01-01', '+1 year') - julianday(y.period || '-01-01')) * 24.0)
+    * 100,
+    1
+  ) AS period_utilization_pct,
   CASE
     WHEN p.policy_max IS NULL THEN 'NO_POLICY'
-    WHEN (CAST(y.usage_count AS REAL) / NULLIF(y.active_snapshots,0)) >= p.policy_max * 0.8
-         THEN 'EFFECTIVE_USE'
-    WHEN (CAST(y.usage_count AS REAL) / NULLIF(y.active_snapshots,0)) >= p.policy_max * 0.3
-         THEN 'PARTIAL_USE'
+    WHEN y.usage_hours /
+         (NULLIF(p.policy_max, 0) *
+          (julianday(y.period || '-01-01', '+1 year') - julianday(y.period || '-01-01')) * 24.0)
+         >= 0.6 THEN 'EFFECTIVE_USE'
+    WHEN y.usage_hours /
+         (NULLIF(p.policy_max, 0) *
+          (julianday(y.period || '-01-01', '+1 year') - julianday(y.period || '-01-01')) * 24.0)
+         >= 0.2 THEN 'PARTIAL_USE'
     ELSE 'UNDERUTILIZED'
   END AS utilization_status
 FROM v_usage_yearly y
