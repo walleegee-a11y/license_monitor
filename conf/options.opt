@@ -1,0 +1,23 @@
+# -----------------------------
+# PrimeTime – mixed model
+# -----------------------------
+GROUP PT_SCOTT scott-nice
+GROUP PT_SALLY sally-cute
+
+EXCLUDE PrimeTime ALL
+EXCLUDE Design-Compiler ALL
+
+INCLUDE PrimeTime USER scott-nice
+MAX 2 PrimeTime USER scott-nice
+
+
+INCLUDE PrimeTime USER sally-cute
+MAX 1 PrimeTime USER sally-cute
+
+
+INCLUDE Design-Compiler USER scott-nice
+MAX 2 Design-Compiler USER scott-nice
+
+
+INCLUDE Design-Compiler USER sally-cute
+MAX 1 Design-Compiler USER sally-cute

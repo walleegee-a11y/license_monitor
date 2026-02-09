@@ -1,0 +1,29 @@
+# Runtime data
+db/
+raw/
+rawx/
+raw.tar
+exports/
+reports/
+log/
+nul
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE / tools
+.claude/
+.bkit-memory.json
+.pdca-status.json
+
+# Screenshots
+*.png
+
+# Swap/temp files
+*.swp
+*.swo
+*~
+
+# Duplicate/temp
+bin/bin/
