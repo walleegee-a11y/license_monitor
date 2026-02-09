@@ -18,7 +18,8 @@ import sqlite3
 import base64
 import subprocess
 from io import BytesIO
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+import calendar
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
@@ -177,6 +178,7 @@ class PolicyLoader:
         except Exception:
             pass
         return rows
+
 
 
 # ============================================================
@@ -549,29 +551,37 @@ class LicenseMonitorGUI(QMainWindow):
         period_layout = QVBoxLayout()
         period_layout.setContentsMargins(6, 4, 6, 4)
 
-        quick_row = QHBoxLayout()
-        quick_row.addWidget(QLabel("Quick:"))
-        for label, days in [("Weekly", 7), ("Monthly", 30), ("Quarterly", 90), ("Yearly", 365)]:
-            btn = QPushButton(label)
-            btn.clicked.connect(lambda checked, d=days: self._quick_period(d))
-            quick_row.addWidget(btn)
-        quick_row.addStretch()
-        period_layout.addLayout(quick_row)
-
         custom_row = QHBoxLayout()
         custom_row.addWidget(QLabel("Period:"))
         custom_row.addWidget(QLabel("Start"))
         self.start_date_edit = QDateEdit()
         self.start_date_edit.setCalendarPopup(True)
         self.start_date_edit.setDate(QDate.currentDate().addDays(-7))
+        self.start_date_edit.dateChanged.connect(self._on_custom_date_changed)
         custom_row.addWidget(self.start_date_edit)
         custom_row.addWidget(QLabel("End"))
         self.end_date_edit = QDateEdit()
         self.end_date_edit.setCalendarPopup(True)
         self.end_date_edit.setDate(QDate.currentDate())
+        self.end_date_edit.dateChanged.connect(self._on_custom_date_changed)
         custom_row.addWidget(self.end_date_edit)
         custom_row.addStretch()
         period_layout.addLayout(custom_row)
+
+        # Quick period selector: granularity combo + period combo
+        quick_row = QHBoxLayout()
+        quick_row.addWidget(QLabel("Quick:"))
+        self.quick_granularity = QComboBox()
+        self.quick_granularity.addItems(["(None)", "Weekly", "Monthly", "Quarterly", "Yearly"])
+        self.quick_granularity.currentTextChanged.connect(self._on_quick_granularity_changed)
+        quick_row.addWidget(self.quick_granularity)
+        self.quick_period_combo = QComboBox()
+        self.quick_period_combo.setMinimumWidth(140)
+        self.quick_period_combo.setEnabled(False)
+        self.quick_period_combo.currentTextChanged.connect(self._on_quick_period_changed)
+        quick_row.addWidget(self.quick_period_combo)
+        quick_row.addStretch()
+        period_layout.addLayout(quick_row)
 
         period_group.setLayout(period_layout)
         top_bar.addWidget(period_group, stretch=1)
@@ -1056,12 +1066,111 @@ class LicenseMonitorGUI(QMainWindow):
             self._update_chart(self.filtered_data)
 
     # --------------------------------------------------------
-    # Quick period buttons
+    # Quick period selector
     # --------------------------------------------------------
-    def _quick_period(self, days):
-        today = QDate.currentDate()
-        self.start_date_edit.setDate(today.addDays(-days))
-        self.end_date_edit.setDate(today)
+    def _on_custom_date_changed(self):
+        """User manually changed a date picker — deactivate Quick selector."""
+        if self.quick_granularity.currentText() != "(None)":
+            self.quick_granularity.blockSignals(True)
+            self.quick_granularity.setCurrentText("(None)")
+            self.quick_granularity.blockSignals(False)
+            self.quick_period_combo.blockSignals(True)
+            self.quick_period_combo.clear()
+            self.quick_period_combo.setEnabled(False)
+            self.quick_period_combo.blockSignals(False)
+            self.start_date_edit.setEnabled(True)
+            self.end_date_edit.setEnabled(True)
+
+    def _on_quick_granularity_changed(self, granularity):
+        """Populate the period combo with specific periods for the chosen granularity."""
+        is_quick = granularity != "(None)"
+        self.start_date_edit.setEnabled(not is_quick)
+        self.end_date_edit.setEnabled(not is_quick)
+
+        self.quick_period_combo.blockSignals(True)
+        self.quick_period_combo.clear()
+
+        if not is_quick:
+            self.quick_period_combo.setEnabled(False)
+            self.quick_period_combo.blockSignals(False)
+            return
+
+        self.quick_period_combo.setEnabled(True)
+        today = date.today()
+        year = today.year
+
+        if granularity == "Weekly":
+            # ISO weeks 01..current week
+            current_week = today.isocalendar()[1]
+            for w in range(1, current_week + 1):
+                self.quick_period_combo.addItem(f"Week-{w:02d}")
+            self.quick_period_combo.setCurrentIndex(self.quick_period_combo.count() - 1)
+        elif granularity == "Monthly":
+            for m in range(1, today.month + 1):
+                self.quick_period_combo.addItem(f"Month-{m:02d}")
+            self.quick_period_combo.setCurrentIndex(self.quick_period_combo.count() - 1)
+        elif granularity == "Quarterly":
+            current_q = (today.month - 1) // 3 + 1
+            for q in range(1, current_q + 1):
+                self.quick_period_combo.addItem(f"Quarter-{q:02d}")
+            self.quick_period_combo.setCurrentIndex(self.quick_period_combo.count() - 1)
+        elif granularity == "Yearly":
+            # Show current year and previous year
+            for y in range(year - 1, year + 1):
+                self.quick_period_combo.addItem(f"Year-{y}")
+            self.quick_period_combo.setCurrentIndex(self.quick_period_combo.count() - 1)
+
+        self.quick_period_combo.blockSignals(False)
+        # Trigger analysis for the selected period
+        self._on_quick_period_changed(self.quick_period_combo.currentText())
+
+    def _on_quick_period_changed(self, period_text):
+        """Compute exact start/end dates from the chosen period and run Analyze."""
+        if not period_text:
+            return
+        granularity = self.quick_granularity.currentText()
+        if granularity == "(None)":
+            return
+
+        today = date.today()
+        year = today.year
+
+        if granularity == "Weekly":
+            week = int(period_text.split("-")[1])
+            # ISO week: Monday of that week
+            jan4 = date(year, 1, 4)  # Jan 4 is always in ISO week 1
+            start = jan4 - timedelta(days=jan4.weekday()) + timedelta(weeks=week - 1)
+            end = start + timedelta(days=6)
+        elif granularity == "Monthly":
+            month = int(period_text.split("-")[1])
+            start = date(year, month, 1)
+            last_day = calendar.monthrange(year, month)[1]
+            end = date(year, month, last_day)
+        elif granularity == "Quarterly":
+            q = int(period_text.split("-")[1])
+            start_month = (q - 1) * 3 + 1
+            end_month = start_month + 2
+            start = date(year, start_month, 1)
+            last_day = calendar.monthrange(year, end_month)[1]
+            end = date(year, end_month, last_day)
+        elif granularity == "Yearly":
+            y = int(period_text.split("-")[1])
+            start = date(y, 1, 1)
+            end = date(y, 12, 31)
+        else:
+            return
+
+        # Cap end date to today if in the future
+        if end > today:
+            end = today
+
+        # Block date signals so setting dates doesn't reset Quick
+        self.start_date_edit.blockSignals(True)
+        self.end_date_edit.blockSignals(True)
+        self.start_date_edit.setDate(QDate(start.year, start.month, start.day))
+        self.end_date_edit.setDate(QDate(end.year, end.month, end.day))
+        self.start_date_edit.blockSignals(False)
+        self.end_date_edit.blockSignals(False)
         self._run_analyze()
 
     # --------------------------------------------------------
@@ -1786,8 +1895,17 @@ class LicenseMonitorGUI(QMainWindow):
             QMessageBox.warning(self, "No Data", "Nothing to export. Run Analyze first.")
             return
 
+        # Build default filename
+        now = datetime.now()
+        ts_prefix = now.strftime("%Y%m%d_%H%M%S")
+        start_qd = self.start_date_edit.date()
+        end_qd = self.end_date_edit.date()
+        start_str = start_qd.toString("yyyyMMdd")
+        end_str = end_qd.toString("yyyyMMdd")
+        default_name = f"{ts_prefix}_{start_str}_{end_str}.csv"
+
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Export Filtered Data", "license_usage_export.csv",
+            self, "Export Filtered Data", default_name,
             "CSV Files (*.csv);;All Files (*)"
         )
         if not file_path:
@@ -1804,29 +1922,19 @@ class LicenseMonitorGUI(QMainWindow):
     # Export HTML Report
     # --------------------------------------------------------
     def _determine_period_info(self, start_date, end_date):
-        """Classify period type and compute ordinal from start of year."""
+        """Classify period type and compute ordinal from date range."""
         delta = (end_date - start_date).days
-        year_start = date(start_date.year, 1, 1)
-
-        if delta <= 2:
-            period_type = "daily"
-            day_of_year = (start_date - year_start).days + 1
-            ordinal = f"D{day_of_year:03d}"
-        elif delta <= 7:
+        if delta <= 7:
             period_type = "weekly"
-            week_num = ((start_date - year_start).days // 7) + 1
-            ordinal = f"W{week_num:02d}"
         elif delta <= 31:
             period_type = "monthly"
-            ordinal = f"M{start_date.month:02d}"
         elif delta <= 93:
             period_type = "quarterly"
-            quarter = (start_date.month - 1) // 3 + 1
-            ordinal = f"Q{quarter}"
-        else:
+        elif delta <= 366:
             period_type = "yearly"
-            ordinal = f"Y{start_date.year}"
-
+        else:
+            period_type = "custom"
+        ordinal = f"{start_date}_{end_date}"
         return period_type, ordinal
 
     def _render_chart_to_base64(self, df, start_d, end_d, policy_map=None):
