@@ -2689,6 +2689,11 @@ function switchTab(tabId) {{
             QMessageBox.warning(self, "No Data", "Nothing to export. Run Analyze first.")
             return
 
+        # Start animation immediately so user sees instant feedback
+        self._start_export_html_anim()
+        self.status_bar.showMessage("Generating HTML report...")
+        QApplication.processEvents()
+
         start_qd = self.start_date_edit.date()
         end_qd = self.end_date_edit.date()
         start_d = date(start_qd.year(), start_qd.month(), start_qd.day())
@@ -2704,10 +2709,6 @@ function switchTab(tabId) {{
         EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         export_path = EXPORT_DIR / filename
 
-        self._start_export_html_anim()
-        self.status_bar.showMessage("Generating HTML report...")
-        QApplication.processEvents()
-
         try:
             df = self.filtered_data
 
@@ -2716,12 +2717,14 @@ function switchTab(tabId) {{
             all_users = set(df["user"].unique())
             overall_policy = self._policy_map_for_users(all_users)
             chart_b64 = self._render_chart_to_base64(df, start_d, end_d, overall_policy)
+            QApplication.processEvents()
             stats = self._build_stats_rows(df, overall_policy, period_hours)
             overuse = self._build_overuse_analysis(df, overall_policy)
             company_bd = self._build_company_breakdown(df)
             feat_comp = self._build_feature_company_matrix(df)
             top_users = self._build_top_users(df)
             user_activity = self._build_user_activity(df)
+            QApplication.processEvents()
 
             meta = {
                 "generated": now.strftime("%Y-%m-%d %H:%M:%S"),
