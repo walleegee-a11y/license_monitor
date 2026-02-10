@@ -1926,7 +1926,7 @@ class LicenseMonitorGUI(QMainWindow):
 
         Uses the quick period selector when active for accurate naming
         (e.g. weekly-03, monthly-08, yearly).  Falls back to
-        date-range heuristics when the quick selector is not used.
+        date range format when the quick selector is not used.
         """
         granularity = self.quick_granularity.currentText()
         period_text = self.quick_period_combo.currentText()
@@ -1945,20 +1945,8 @@ class LicenseMonitorGUI(QMainWindow):
             elif granularity == "Yearly":
                 return "yearly", "yearly"
 
-        # Fallback: infer from the date range itself
-        delta = (end_date - start_date).days
-        if delta <= 7:
-            week_num = start_date.isocalendar()[1]
-            return "weekly", f"weekly-{week_num:02d}"
-        elif delta <= 31:
-            return "monthly", f"monthly-{start_date.month:02d}"
-        elif delta <= 93:
-            q = (start_date.month - 1) // 3 + 1
-            return "quarterly", f"quarterly-Q{q}"
-        elif delta <= 366:
-            return "yearly", "yearly"
-        else:
-            return "custom", f"{start_date}_{end_date}"
+        # No quick-period active: use date range as-is
+        return "custom", f"{start_date}_{end_date}"
 
     def _render_chart_to_base64(self, df, start_d, end_d, policy_map=None):
         """Render usage trend chart to a base64-encoded PNG string."""
