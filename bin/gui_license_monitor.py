@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView, QFrame, QCheckBox, QComboBox,
     QSplitter, QLineEdit,
 )
-from PyQt5.QtCore import Qt, QDate, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QDate, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -584,7 +584,7 @@ class LicenseMonitorGUI(QMainWindow):
         period_layout.addLayout(quick_row)
 
         period_group.setLayout(period_layout)
-        top_bar.addWidget(period_group, stretch=1)
+        top_bar.addWidget(period_group, stretch=7)
 
         # Action buttons (vertical stack, right side)
         action_group = QGroupBox("Actions")
@@ -612,12 +612,25 @@ class LicenseMonitorGUI(QMainWindow):
         self._analyze_btn_done_style = "background-color: #4CAF50; color: white;"
         self._analyze_btn_error_style = "background-color: #F44336; color: white;"
         self.analyze_btn.setStyleSheet(self._analyze_btn_default_style)
+        self._analyze_anim_timer = QTimer(self)
+        self._analyze_anim_timer.setInterval(150)
+        self._analyze_anim_dots = 0
+        self._analyze_anim_timer.timeout.connect(self._on_analyze_anim_tick)
         self.analyze_btn.clicked.connect(self._run_analyze)
         action_row2.addWidget(self.analyze_btn)
         self.export_btn = QPushButton("Export CSV")
         self.export_btn.clicked.connect(self._export_csv)
         action_row2.addWidget(self.export_btn)
         self.export_html_btn = QPushButton("Export HTML")
+        self._export_html_default_style = "background-color: #2196F3; color: white;"
+        self._export_html_running_style = "background-color: #FFA500; color: white;"
+        self._export_html_done_style = "background-color: #4CAF50; color: white;"
+        self._export_html_error_style = "background-color: #F44336; color: white;"
+        self.export_html_btn.setStyleSheet(self._export_html_default_style)
+        self._export_html_anim_timer = QTimer(self)
+        self._export_html_anim_timer.setInterval(150)
+        self._export_html_anim_idx = 0
+        self._export_html_anim_timer.timeout.connect(self._on_export_html_anim_tick)
         self.export_html_btn.clicked.connect(self._export_html)
         action_row2.addWidget(self.export_html_btn)
         action_layout.addLayout(action_row2)
@@ -634,7 +647,7 @@ class LicenseMonitorGUI(QMainWindow):
         action_layout.addLayout(action_row3)
 
         action_group.setLayout(action_layout)
-        top_bar.addWidget(action_group)
+        top_bar.addWidget(action_group, stretch=3)
 
         root.addLayout(top_bar)
 
@@ -652,37 +665,7 @@ class LicenseMonitorGUI(QMainWindow):
         left_layout.setContentsMargins(2, 2, 2, 2)
         left_layout.setSpacing(4)
 
-        # -- Features --
-        self.feature_label = QLabel("Features")
-        self.feature_label.setStyleSheet("font-weight: bold;")
-        left_layout.addWidget(self.feature_label)
-
-        feat_btn_row = QHBoxLayout()
-        feat_btn_row.setSpacing(2)
-        feat_all_btn = QPushButton("All")
-        feat_all_btn.setFixedHeight(22)
-        feat_all_btn.clicked.connect(lambda: self._select_all(self.feature_list))
-        feat_btn_row.addWidget(feat_all_btn)
-        feat_none_btn = QPushButton("None")
-        feat_none_btn.setFixedHeight(22)
-        feat_none_btn.clicked.connect(lambda: self._select_none(self.feature_list))
-        feat_btn_row.addWidget(feat_none_btn)
-        feat_btn_row.addStretch()
-        left_layout.addLayout(feat_btn_row)
-
-        self.feature_search = QLineEdit()
-        self.feature_search.setPlaceholderText("Search features...")
-        self.feature_search.setClearButtonEnabled(True)
-        self.feature_search.textChanged.connect(
-            lambda text: self._filter_list(self.feature_list, text))
-        left_layout.addWidget(self.feature_search)
-
-        self.feature_list = QListWidget()
-        self.feature_list.setSelectionMode(QAbstractItemView.MultiSelection)
-        self.feature_list.itemSelectionChanged.connect(self._on_filter_changed)
-        left_layout.addWidget(self.feature_list, stretch=3)
-
-        # -- Companies --
+        # -- Companies (50%) --
         self.company_label = QLabel("Companies")
         self.company_label.setStyleSheet("font-weight: bold;")
         left_layout.addWidget(self.company_label)
@@ -710,9 +693,39 @@ class LicenseMonitorGUI(QMainWindow):
         self.company_list = QListWidget()
         self.company_list.setSelectionMode(QAbstractItemView.MultiSelection)
         self.company_list.itemSelectionChanged.connect(self._on_company_filter_changed)
-        left_layout.addWidget(self.company_list, stretch=2)
+        left_layout.addWidget(self.company_list, stretch=5)
 
-        # -- Users --
+        # -- Features (40%) --
+        self.feature_label = QLabel("Features")
+        self.feature_label.setStyleSheet("font-weight: bold;")
+        left_layout.addWidget(self.feature_label)
+
+        feat_btn_row = QHBoxLayout()
+        feat_btn_row.setSpacing(2)
+        feat_all_btn = QPushButton("All")
+        feat_all_btn.setFixedHeight(22)
+        feat_all_btn.clicked.connect(lambda: self._select_all(self.feature_list))
+        feat_btn_row.addWidget(feat_all_btn)
+        feat_none_btn = QPushButton("None")
+        feat_none_btn.setFixedHeight(22)
+        feat_none_btn.clicked.connect(lambda: self._select_none(self.feature_list))
+        feat_btn_row.addWidget(feat_none_btn)
+        feat_btn_row.addStretch()
+        left_layout.addLayout(feat_btn_row)
+
+        self.feature_search = QLineEdit()
+        self.feature_search.setPlaceholderText("Search features...")
+        self.feature_search.setClearButtonEnabled(True)
+        self.feature_search.textChanged.connect(
+            lambda text: self._filter_list(self.feature_list, text))
+        left_layout.addWidget(self.feature_search)
+
+        self.feature_list = QListWidget()
+        self.feature_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.feature_list.itemSelectionChanged.connect(self._on_filter_changed)
+        left_layout.addWidget(self.feature_list, stretch=4)
+
+        # -- Users (10%) --
         self.user_label = QLabel("Users")
         self.user_label.setStyleSheet("font-weight: bold;")
         left_layout.addWidget(self.user_label)
@@ -740,7 +753,7 @@ class LicenseMonitorGUI(QMainWindow):
         self.user_list = QListWidget()
         self.user_list.setSelectionMode(QAbstractItemView.MultiSelection)
         self.user_list.itemSelectionChanged.connect(self._on_filter_changed)
-        left_layout.addWidget(self.user_list, stretch=2)
+        left_layout.addWidget(self.user_list, stretch=1)
 
         left_pane.setLayout(left_layout)
         left_pane.setMinimumWidth(140)
@@ -1071,6 +1084,46 @@ class LicenseMonitorGUI(QMainWindow):
             self._update_chart(self.filtered_data)
 
     # --------------------------------------------------------
+    # Analyze button animation
+    # --------------------------------------------------------
+    _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def _start_analyze_anim(self):
+        self._analyze_anim_idx = 0
+        self._analyze_anim_timer.start()
+
+    def _stop_analyze_anim(self):
+        self._analyze_anim_timer.stop()
+
+    def _on_analyze_anim_tick(self):
+        frame = self._SPINNER_FRAMES[self._analyze_anim_idx % len(self._SPINNER_FRAMES)]
+        self.analyze_btn.setText(f"{frame}  Analyzing")
+        self._analyze_anim_idx += 1
+
+    # --------------------------------------------------------
+    # Export HTML button animation
+    # --------------------------------------------------------
+    def _start_export_html_anim(self):
+        self._export_html_anim_idx = 0
+        self.export_html_btn.setStyleSheet(self._export_html_running_style)
+        self.export_html_btn.setEnabled(False)
+        self._export_html_anim_timer.start()
+
+    def _stop_export_html_anim(self, success=True):
+        self._export_html_anim_timer.stop()
+        self.export_html_btn.setEnabled(True)
+        self.export_html_btn.setText("Export HTML")
+        if success:
+            self.export_html_btn.setStyleSheet(self._export_html_done_style)
+        else:
+            self.export_html_btn.setStyleSheet(self._export_html_error_style)
+
+    def _on_export_html_anim_tick(self):
+        frame = self._SPINNER_FRAMES[self._export_html_anim_idx % len(self._SPINNER_FRAMES)]
+        self.export_html_btn.setText(f"{frame}  Exporting")
+        self._export_html_anim_idx += 1
+
+    # --------------------------------------------------------
     # Quick period selector
     # --------------------------------------------------------
     def _on_custom_date_changed(self):
@@ -1210,7 +1263,7 @@ class LicenseMonitorGUI(QMainWindow):
 
         self.analyze_btn.setEnabled(False)
         self.analyze_btn.setStyleSheet(self._analyze_btn_running_style)
-        self.analyze_btn.setText("Analyzing...")
+        self._start_analyze_anim()
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.status_bar.showMessage("Scanning files...")
@@ -1227,6 +1280,7 @@ class LicenseMonitorGUI(QMainWindow):
     def _on_analysis_complete(self, df, file_count):
         self.raw_data = df
         self._cached_interval = None   # reset so interval is re-detected
+        self._stop_analyze_anim()
         self.analyze_btn.setEnabled(True)
         self.analyze_btn.setText("Analyze")
         self.analyze_btn.setStyleSheet(self._analyze_btn_done_style)
@@ -1252,6 +1306,7 @@ class LicenseMonitorGUI(QMainWindow):
         )
 
     def _on_analysis_error(self, msg):
+        self._stop_analyze_anim()
         self.analyze_btn.setEnabled(True)
         self.analyze_btn.setText("Analyze")
         self.analyze_btn.setStyleSheet(self._analyze_btn_error_style)
@@ -2644,6 +2699,7 @@ function switchTab(tabId) {{
         EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         export_path = EXPORT_DIR / filename
 
+        self._start_export_html_anim()
         self.status_bar.showMessage("Generating HTML report...")
         QApplication.processEvents()
 
@@ -2699,12 +2755,14 @@ function switchTab(tabId) {{
             with open(export_path, "w", encoding="utf-8") as f:
                 f.write(html)
 
+            self._stop_export_html_anim(success=True)
             self.status_bar.showMessage(f"HTML report exported: {export_path}")
             QMessageBox.information(
                 self, "Export Complete",
                 f"HTML audit report saved to:\n{export_path}"
             )
         except Exception as e:
+            self._stop_export_html_anim(success=False)
             self.status_bar.showMessage(f"Export error: {e}")
             QMessageBox.critical(self, "Export Error", str(e))
 
