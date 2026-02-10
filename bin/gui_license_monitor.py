@@ -1922,20 +1922,43 @@ class LicenseMonitorGUI(QMainWindow):
     # Export HTML Report
     # --------------------------------------------------------
     def _determine_period_info(self, start_date, end_date):
-        """Classify period type and compute ordinal from date range."""
+        """Classify period type and compute ordinal from date range.
+
+        Uses the quick period selector when active for accurate naming
+        (e.g. weekly-03, monthly-08, yearly).  Falls back to
+        date-range heuristics when the quick selector is not used.
+        """
+        granularity = self.quick_granularity.currentText()
+        period_text = self.quick_period_combo.currentText()
+
+        # If a quick-period is actively selected, derive from it directly
+        if granularity != "(None)" and period_text:
+            if granularity == "Weekly":
+                week = int(period_text.split("-")[1])
+                return "weekly", f"weekly-{week:02d}"
+            elif granularity == "Monthly":
+                month = int(period_text.split("-")[1])
+                return "monthly", f"monthly-{month:02d}"
+            elif granularity == "Quarterly":
+                q = int(period_text.split("-")[1])
+                return "quarterly", f"quarterly-Q{q}"
+            elif granularity == "Yearly":
+                return "yearly", "yearly"
+
+        # Fallback: infer from the date range itself
         delta = (end_date - start_date).days
         if delta <= 7:
-            period_type = "weekly"
+            week_num = start_date.isocalendar()[1]
+            return "weekly", f"weekly-{week_num:02d}"
         elif delta <= 31:
-            period_type = "monthly"
+            return "monthly", f"monthly-{start_date.month:02d}"
         elif delta <= 93:
-            period_type = "quarterly"
+            q = (start_date.month - 1) // 3 + 1
+            return "quarterly", f"quarterly-Q{q}"
         elif delta <= 366:
-            period_type = "yearly"
+            return "yearly", "yearly"
         else:
-            period_type = "custom"
-        ordinal = f"{start_date}_{end_date}"
-        return period_type, ordinal
+            return "custom", f"{start_date}_{end_date}"
 
     def _render_chart_to_base64(self, df, start_d, end_d, policy_map=None):
         """Render usage trend chart to a base64-encoded PNG string."""
@@ -2615,7 +2638,7 @@ function switchTab(tabId) {{
         # Build filename
         now = datetime.now()
         ts_prefix = now.strftime("%Y%m%d_%H%M%S")
-        filename = f"{ts_prefix}_{ordinal}_{period_type}.html"
+        filename = f"{ts_prefix}_{ordinal}.html"
 
         EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         export_path = EXPORT_DIR / filename
