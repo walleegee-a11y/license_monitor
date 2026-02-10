@@ -1646,7 +1646,10 @@ class LicenseMonitorGUI(QMainWindow):
         ax.xaxis.set_major_formatter(DateFormatter(tick_fmt))
         ax.tick_params(axis="both", labelsize=fs)
         self.figure.autofmt_xdate(rotation=45)
-        ax.grid(opts["grid"], alpha=0.3)
+        if opts["grid"]:
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.grid(False)
         ax.legend(loc=opts["legend_loc"], fontsize=max(fs - 2, 6), ncol=2)
 
         # Dynamic title
@@ -2490,7 +2493,9 @@ class LicenseMonitorGUI(QMainWindow):
   .alert-banner h3 {{ margin: 0 0 6px 0; color: #856404; }}
   .over-highlight {{ background: #ffe0e0; font-weight: bold; }}
   .tab-bar {{ display: flex; flex-wrap: wrap; gap: 0; margin-top: 24px;
-              border-bottom: 3px solid #1a3a5c; }}
+              border-bottom: 3px solid #1a3a5c;
+              position: sticky; top: 0; z-index: 100;
+              background: #fff; padding-top: 8px; }}
   .tab-btn {{ padding: 10px 22px; cursor: pointer; background: #e8eef5;
               border: 1px solid #ccc; border-bottom: none; border-radius: 6px 6px 0 0;
               font-size: 0.95em; font-weight: bold; color: #1a3a5c;
