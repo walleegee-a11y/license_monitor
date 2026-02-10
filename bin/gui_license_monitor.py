@@ -607,6 +607,11 @@ class LicenseMonitorGUI(QMainWindow):
         font = self.analyze_btn.font()
         font.setBold(True)
         self.analyze_btn.setFont(font)
+        self._analyze_btn_default_style = "background-color: #2196F3; color: white;"
+        self._analyze_btn_running_style = "background-color: #FFA500; color: white;"
+        self._analyze_btn_done_style = "background-color: #4CAF50; color: white;"
+        self._analyze_btn_error_style = "background-color: #F44336; color: white;"
+        self.analyze_btn.setStyleSheet(self._analyze_btn_default_style)
         self.analyze_btn.clicked.connect(self._run_analyze)
         action_row2.addWidget(self.analyze_btn)
         self.export_btn = QPushButton("Export CSV")
@@ -1096,37 +1101,39 @@ class LicenseMonitorGUI(QMainWindow):
             return
 
         self.quick_period_combo.setEnabled(True)
+        self.analyze_btn.setStyleSheet(self._analyze_btn_default_style)
+        self.analyze_btn.setText("Analyze")
         today = date.today()
         year = today.year
+
+        # Add placeholder prompt as first item
+        self.quick_period_combo.addItem(f"-- Select {granularity} --")
 
         if granularity == "Weekly":
             # ISO weeks 01..current week
             current_week = today.isocalendar()[1]
             for w in range(1, current_week + 1):
                 self.quick_period_combo.addItem(f"Week-{w:02d}")
-            self.quick_period_combo.setCurrentIndex(self.quick_period_combo.count() - 1)
         elif granularity == "Monthly":
             for m in range(1, today.month + 1):
                 self.quick_period_combo.addItem(f"Month-{m:02d}")
-            self.quick_period_combo.setCurrentIndex(self.quick_period_combo.count() - 1)
         elif granularity == "Quarterly":
             current_q = (today.month - 1) // 3 + 1
             for q in range(1, current_q + 1):
                 self.quick_period_combo.addItem(f"Quarter-{q:02d}")
-            self.quick_period_combo.setCurrentIndex(self.quick_period_combo.count() - 1)
         elif granularity == "Yearly":
             # Show current year and previous year
             for y in range(year - 1, year + 1):
                 self.quick_period_combo.addItem(f"Year-{y}")
-            self.quick_period_combo.setCurrentIndex(self.quick_period_combo.count() - 1)
+
+        # Start on placeholder so user must explicitly pick an item
+        self.quick_period_combo.setCurrentIndex(0)
 
         self.quick_period_combo.blockSignals(False)
-        # Trigger analysis for the selected period
-        self._on_quick_period_changed(self.quick_period_combo.currentText())
 
     def _on_quick_period_changed(self, period_text):
         """Compute exact start/end dates from the chosen period and run Analyze."""
-        if not period_text:
+        if not period_text or period_text.startswith("-- "):
             return
         granularity = self.quick_granularity.currentText()
         if granularity == "(None)":
@@ -1202,6 +1209,8 @@ class LicenseMonitorGUI(QMainWindow):
         end = date(end_qd.year(), end_qd.month(), end_qd.day())
 
         self.analyze_btn.setEnabled(False)
+        self.analyze_btn.setStyleSheet(self._analyze_btn_running_style)
+        self.analyze_btn.setText("Analyzing...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.status_bar.showMessage("Scanning files...")
@@ -1219,6 +1228,8 @@ class LicenseMonitorGUI(QMainWindow):
         self.raw_data = df
         self._cached_interval = None   # reset so interval is re-detected
         self.analyze_btn.setEnabled(True)
+        self.analyze_btn.setText("Analyze")
+        self.analyze_btn.setStyleSheet(self._analyze_btn_done_style)
         self.progress_bar.setVisible(False)
 
         # Compute policy map before populating filters (so policy features appear)
@@ -1242,6 +1253,8 @@ class LicenseMonitorGUI(QMainWindow):
 
     def _on_analysis_error(self, msg):
         self.analyze_btn.setEnabled(True)
+        self.analyze_btn.setText("Analyze")
+        self.analyze_btn.setStyleSheet(self._analyze_btn_error_style)
         self.progress_bar.setVisible(False)
         self.status_bar.showMessage(f"Error: {msg}")
         QMessageBox.critical(self, "Analysis Error", msg)
@@ -1932,7 +1945,7 @@ class LicenseMonitorGUI(QMainWindow):
         period_text = self.quick_period_combo.currentText()
 
         # If a quick-period is actively selected, derive from it directly
-        if granularity != "(None)" and period_text:
+        if granularity != "(None)" and period_text and not period_text.startswith("-- "):
             if granularity == "Weekly":
                 week = int(period_text.split("-")[1])
                 return "weekly", f"weekly-{week:02d}"
