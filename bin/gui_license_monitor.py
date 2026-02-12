@@ -530,10 +530,12 @@ class LicenseMonitorGUI(QMainWindow):
         self.policy_map = {}          # {feature: policy_max} — computed per filter
         self.user_company_map = {}    # {user: company} — from policy
         self.config = {}              # parsed from conf/license_monitor.conf.csh
+        self.last_exported_html = None  # track last exported HTML file path
 
         self._init_ui()
         self._load_policy()
         self._load_config()
+        self._check_existing_exports()  # Enable View button if exports exist
 
     # --------------------------------------------------------
     # UI construction
@@ -633,6 +635,11 @@ class LicenseMonitorGUI(QMainWindow):
         self._export_html_anim_timer.timeout.connect(self._on_export_html_anim_tick)
         self.export_html_btn.clicked.connect(self._export_html)
         action_row2.addWidget(self.export_html_btn)
+        self.view_html_btn = QPushButton("View HTML")
+        self.view_html_btn.setToolTip("Open an exported HTML report in your default browser (shows file selection if multiple reports exist)")
+        self.view_html_btn.setEnabled(False)  # Disabled until exports exist
+        self.view_html_btn.clicked.connect(self._view_html)
+        action_row2.addWidget(self.view_html_btn)
         action_layout.addLayout(action_row2)
 
         action_row3 = QHBoxLayout()
@@ -950,6 +957,18 @@ class LicenseMonitorGUI(QMainWindow):
             self.status_bar.showMessage(
                 "Ready (collection disabled — conf/license_monitor.conf.csh not found or incomplete)."
             )
+
+    def _check_existing_exports(self):
+        """Check if any HTML files exist in exports directory and enable View button if found."""
+        if not EXPORT_DIR.exists():
+            return
+
+        html_files = sorted(EXPORT_DIR.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if html_files:
+            # Enable button if exports exist
+            self.view_html_btn.setEnabled(True)
+            # Set last_exported_html to the most recent file
+            self.last_exported_html = str(html_files[0])
 
     # --------------------------------------------------------
     # Collect lmstat snapshot
@@ -2689,8 +2708,10 @@ function switchTab(tabId) {{
             QMessageBox.warning(self, "No Data", "Nothing to export. Run Analyze first.")
             return
 
-        # Start animation immediately so user sees instant feedback
+        # Start animation and show progress bar immediately
         self._start_export_html_anim()
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
         self.status_bar.showMessage("Generating HTML report...")
         QApplication.processEvents()
 
@@ -2711,21 +2732,47 @@ function switchTab(tabId) {{
 
         try:
             df = self.filtered_data
+            num_companies = df["company"].nunique()
+
+            # Calculate total steps: 8 overall steps + 4 steps per company + 1 final write
+            total_steps = 8 + (num_companies * 4) + 1
+            current_step = 0
+
+            def update_progress(step_name):
+                nonlocal current_step
+                current_step += 1
+                pct = int((current_step / total_steps) * 100)
+                self.progress_bar.setValue(pct)
+                self.status_bar.showMessage(f"Generating report... {step_name}")
+                QApplication.processEvents()
 
             # --- Overall data (policy scoped to filtered users) ---
             period_hours = self._get_period_hours()
             all_users = set(df["user"].unique())
             overall_policy = self._policy_map_for_users(all_users)
-            chart_b64 = self._render_chart_to_base64(df, start_d, end_d, overall_policy)
-            QApplication.processEvents()
-            stats = self._build_stats_rows(df, overall_policy, period_hours)
-            overuse = self._build_overuse_analysis(df, overall_policy)
-            company_bd = self._build_company_breakdown(df)
-            feat_comp = self._build_feature_company_matrix(df)
-            top_users = self._build_top_users(df)
-            user_activity = self._build_user_activity(df)
-            QApplication.processEvents()
 
+            update_progress("rendering overall chart")
+            chart_b64 = self._render_chart_to_base64(df, start_d, end_d, overall_policy)
+
+            update_progress("building statistics")
+            stats = self._build_stats_rows(df, overall_policy, period_hours)
+
+            update_progress("analyzing overuse")
+            overuse = self._build_overuse_analysis(df, overall_policy)
+
+            update_progress("building company breakdown")
+            company_bd = self._build_company_breakdown(df)
+
+            update_progress("building feature matrix")
+            feat_comp = self._build_feature_company_matrix(df)
+
+            update_progress("finding top users")
+            top_users = self._build_top_users(df)
+
+            update_progress("building user activity")
+            user_activity = self._build_user_activity(df)
+
+            update_progress("preparing metadata")
             meta = {
                 "generated": now.strftime("%Y-%m-%d %H:%M:%S"),
                 "start_date": str(start_d),
@@ -2740,22 +2787,34 @@ function switchTab(tabId) {{
 
             # --- Per-company data (policy scoped to company users) ---
             company_tabs = {}
-            for comp in sorted(df["company"].unique()):
+            for idx, comp in enumerate(sorted(df["company"].unique()), 1):
                 cdf = df[df["company"] == comp]
                 comp_users = set(cdf["user"].unique())
                 comp_policy = self._policy_map_for_users(comp_users)
+
+                update_progress(f"[{idx}/{num_companies}] {comp} chart")
+                comp_chart = self._render_chart_to_base64(cdf, start_d, end_d, comp_policy)
+
+                update_progress(f"[{idx}/{num_companies}] {comp} stats")
+                comp_stats = self._build_stats_rows(cdf, comp_policy, period_hours)
+
+                update_progress(f"[{idx}/{num_companies}] {comp} overuse")
+                comp_overuse = self._build_overuse_analysis(cdf, comp_policy)
+
+                update_progress(f"[{idx}/{num_companies}] {comp} top users")
+                comp_top = self._build_top_users(cdf)
+
                 company_tabs[comp] = {
-                    "chart_b64": self._render_chart_to_base64(cdf, start_d, end_d, comp_policy),
-                    "stats": self._build_stats_rows(cdf, comp_policy, period_hours),
-                    "overuse": self._build_overuse_analysis(cdf, comp_policy),
-                    "top_users": self._build_top_users(cdf),
+                    "chart_b64": comp_chart,
+                    "stats": comp_stats,
+                    "overuse": comp_overuse,
+                    "top_users": comp_top,
                     "total_records": len(cdf),
                     "unique_features": cdf["feature"].nunique(),
                     "unique_users": cdf["user"].nunique(),
                 }
-                self.status_bar.showMessage(f"Generating report... ({comp})")
-                QApplication.processEvents()
 
+            update_progress("generating HTML")
             html = self._generate_html(chart_b64, stats, company_bd,
                                        feat_comp, top_users, overuse,
                                        user_activity, company_tabs, meta)
@@ -2763,16 +2822,129 @@ function switchTab(tabId) {{
             with open(export_path, "w", encoding="utf-8") as f:
                 f.write(html)
 
+            # Track last export and enable View button
+            self.last_exported_html = str(export_path)
+            self.view_html_btn.setEnabled(True)
+
+            self.progress_bar.setValue(100)
+            self.progress_bar.setVisible(False)
             self._stop_export_html_anim(success=True)
             self.status_bar.showMessage(f"HTML report exported: {export_path}")
             QMessageBox.information(
                 self, "Export Complete",
-                f"HTML audit report saved to:\n{export_path}"
+                f"HTML audit report saved to:\n{export_path}\n\nClick 'View HTML' to open it in your browser."
             )
         except Exception as e:
+            self.progress_bar.setVisible(False)
             self._stop_export_html_anim(success=False)
             self.status_bar.showMessage(f"Export error: {e}")
             QMessageBox.critical(self, "Export Error", str(e))
+
+    def _view_html(self):
+        """Open an exported HTML report in the default web browser with file selection."""
+        # Get all HTML files in exports directory
+        if not EXPORT_DIR.exists():
+            QMessageBox.warning(
+                self, "No Exports",
+                f"Exports directory does not exist:\n{EXPORT_DIR}\n\nClick 'Export HTML' first."
+            )
+            self.view_html_btn.setEnabled(False)
+            return
+
+        html_files = sorted(EXPORT_DIR.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+        if not html_files:
+            QMessageBox.warning(
+                self, "No Exports",
+                f"No HTML reports found in:\n{EXPORT_DIR}\n\nClick 'Export HTML' first."
+            )
+            self.view_html_btn.setEnabled(False)
+            self.last_exported_html = None
+            return
+
+        # If only one file, open it directly
+        if len(html_files) == 1:
+            selected_file = html_files[0]
+        else:
+            # Show file selection dialog
+            selected_file = self._select_html_file(html_files)
+            if not selected_file:
+                return  # User cancelled
+
+        try:
+            # Use webbrowser module to open in default browser
+            import webbrowser
+            file_url = selected_file.as_uri()
+            webbrowser.open(file_url)
+            self.last_exported_html = str(selected_file)
+            self.status_bar.showMessage(f"Opened in browser: {selected_file.name}")
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Open Error",
+                f"Failed to open HTML file:\n{e}\n\n"
+                f"You can manually open:\n{selected_file}"
+            )
+
+    def _select_html_file(self, html_files):
+        """Show a dialog to select which HTML file to open.
+
+        Args:
+            html_files: List of Path objects for HTML files
+
+        Returns:
+            Path object of selected file, or None if cancelled
+        """
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QListWidget, QPushButton, QHBoxLayout, QLabel
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select HTML Report to Open")
+        dialog.setModal(True)
+        dialog.resize(600, 400)
+
+        layout = QVBoxLayout()
+
+        # Info label
+        info_label = QLabel(f"Found {len(html_files)} HTML report(s). Select one to open:")
+        layout.addWidget(info_label)
+
+        # File list
+        file_list = QListWidget()
+        for html_file in html_files:
+            # Format: filename (modified: 2026-02-12 15:30:45)
+            mtime = datetime.fromtimestamp(html_file.stat().st_mtime)
+            display_text = f"{html_file.name}  (modified: {mtime.strftime('%Y-%m-%d %H:%M:%S')})"
+            item = QListWidgetItem(display_text)
+            item.setData(Qt.UserRole, html_file)  # Store Path object
+            file_list.addItem(item)
+
+        # Select first item by default (most recent)
+        file_list.setCurrentRow(0)
+        file_list.itemDoubleClicked.connect(dialog.accept)  # Double-click to open
+        layout.addWidget(file_list)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        open_btn = QPushButton("Open")
+        open_btn.setDefault(True)
+        open_btn.clicked.connect(dialog.accept)
+        button_layout.addWidget(open_btn)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_btn)
+
+        layout.addLayout(button_layout)
+        dialog.setLayout(layout)
+
+        # Show dialog and get result
+        if dialog.exec_() == QDialog.Accepted:
+            selected_item = file_list.currentItem()
+            if selected_item:
+                return selected_item.data(Qt.UserRole)
+
+        return None
 
 
 # ============================================================
