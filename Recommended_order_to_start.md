@@ -5,11 +5,56 @@ This guide explains the proper sequence for setting up and initializing the Lice
 ## Quick Start Summary
 
 ```
+⚠️  PREREQUISITE: Start lmgrd on license server (lic2)
+
 1. setup_license_monitor.csh        ← Bootstrap (one time)
 2. Edit conf/license_monitor.conf.csh (if needed)
 3. setup_license_monitor_once.csh   ← Initialize (one time)
-4. Start using the application
+4. Start collecting data
 ```
+
+---
+
+## Prerequisite: Start lmgrd License Server
+
+### ⚠️ CRITICAL: This Must Run First
+
+The License Monitor cannot collect any data unless the FlexLM license server is running.
+
+### On License Server (lic2)
+```bash
+# Check if lmgrd is running
+$ ps aux | grep lmgrd
+
+# If not running, start lmgrd
+$ cd /home/appl/synopsys/scl/2025.03/linux64/bin
+$ ./lmgrd -c /path/to/license.lic -l /path/to/lmgrd.log
+```
+
+### Verify lmgrd is Running
+```bash
+# Check server is accepting connections
+$ lmutil lmstat -c 27020@lic2 -a
+
+# Expected output shows:
+# lmgrd (PORT 27020) UP v12.2
+# snpslmd (PORT 27021) UP v12.2
+```
+
+### What Gets Started
+From `conf/license_monitor.conf.csh`:
+```csh
+setenv LM_HOST        "lic2"
+setenv LMGRD_PORT     "27020"
+setenv SNPSLMD_PORT   "27021"
+setenv VENDOR_DAEMON  "snpslmd"
+setenv LMUTIL         "/home/appl/synopsys/scl/2025.03/linux64/bin/lmutil"
+```
+
+**Without lmgrd running:**
+- ❌ `lmutil lmstat` fails
+- ❌ No data collection possible
+- ❌ License Monitor GUI shows "Server unreachable"
 
 ---
 
@@ -153,20 +198,36 @@ The License Monitor GUI provides integrated buttons:
 ## Complete Setup Timeline
 
 ```
-Time    Action                          Script/Tool
------   ------                          -----------
-T+0     Bootstrap system                setup_license_monitor.csh
-T+5min  (Optional) Edit configuration   conf/license_monitor.conf.csh
-T+10min Initialize database             setup_license_monitor_once.csh
-T+15min Collect lmstat snapshot          collect_lmstat.csh
-T+20min Ingest data                      run_ingest.csh
-T+30min Generate reports                 make_reports.py
-T+35min View data in GUI                 gui_license_monitor.py
+Time    Action                                    Script/Tool
+-----   ------                                    -----------
+T+0     ⚠️  START LMGRD on license server (lic2)  lmgrd daemon
+        Verify with: lmutil lmstat -c 27020@lic2 -a
+
+T+1min  Bootstrap License Monitor system         setup_license_monitor.csh
+T+6min  (Optional) Edit configuration            conf/license_monitor.conf.csh
+T+11min Initialize database                      setup_license_monitor_once.csh
+T+16min Collect lmstat snapshot                  collect_lmstat.csh
+T+21min Ingest data into database                run_ingest.csh
+T+30min Generate reports                         make_reports.py
+T+35min View data in GUI                         gui_license_monitor.py
 ```
 
 ---
 
 ## Troubleshooting
+
+### "Server unreachable" or "Connection refused" error
+**Cause:** lmgrd is not running on the license server
+```bash
+# Check if lmgrd is running
+ssh lic2 'ps aux | grep lmgrd'
+
+# If not running, start it
+ssh lic2 'cd /home/appl/synopsys/scl/2025.03/linux64/bin && ./lmgrd -c /path/to/license.lic'
+
+# Verify connection
+lmutil lmstat -c 27020@lic2 -a
+```
 
 ### "config not found" error
 **Cause:** `conf/license_monitor.conf.csh` missing or not sourced
@@ -200,6 +261,15 @@ chmod +x bin/*.csh
 ---
 
 ## Important Notes
+
+### ⚠️ License Server Must Be Running
+
+**This is non-negotiable:** The lmgrd daemon on `lic2` must be running continuously for License Monitor to function. Without it:
+- No data can be collected
+- The GUI shows "Server unreachable"
+- Analysis and reports are impossible
+
+Set up lmgrd restart-on-failure in your init system (systemd, supervisord, etc.).
 
 ### One-Time vs Repeating
 | Script | Frequency | Purpose |
