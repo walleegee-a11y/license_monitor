@@ -40,6 +40,15 @@ import matplotlib.dates as mdates
 
 import pandas as pd
 
+import hashlib
+import hmac as _hmac
+import uuid
+import json
+import platform
+import urllib.request
+import urllib.error
+from cryptography.fernet import Fernet
+
 
 # ============================================================
 # Configuration
@@ -215,6 +224,405 @@ class ConfigLoader:
         except Exception:
             pass
         return config
+
+
+# ============================================================
+# LicenseManager — key-based authorization with trial
+# ============================================================
+
+_LICENSE_SECRET = b"lmon-monitor-secret-2026"   # embedded signing key
+_LICENSE_SERVER_URL = ""                          # set to your validation endpoint URL
+_TRIAL_DAYS = 14
+_STATE_PATH = Path.home() / ".license_monitor_state.json"
+
+def _get_encryption_key(machine_id):
+    """Derive a Fernet encryption key from machine ID."""
+    hash_obj = hashlib.sha256(machine_id.encode())
+    return base64.urlsafe_b64encode(hash_obj.digest())
+
+class LicenseManager:
+    """Manages trial period and license key validation."""
+
+    def __init__(self):
+        self.state = self.load_state()
+
+    def get_machine_id(self):
+        """Generate stable machine fingerprint from hostname, processor, and MAC address."""
+        try:
+            parts = [
+                platform.node(),                    # hostname
+                platform.processor() or "generic",  # CPU info
+                str(uuid.getnode()),                # MAC address as int
+            ]
+            fingerprint = ":".join(parts)
+            return hashlib.sha256(fingerprint.encode()).hexdigest()
+        except Exception:
+            return hashlib.sha256(b"unknown_machine").hexdigest()
+
+    def get_machine_short(self, machine_id=None):
+        """Return first 8 uppercase hex chars of machine_id."""
+        if machine_id is None:
+            machine_id = self.get_machine_id()
+        return machine_id[:8].upper()
+
+    def load_state(self):
+        """Load and decrypt state from ~/.license_monitor_state.json, creating if necessary."""
+        machine_id = self.get_machine_id()
+        key = _get_encryption_key(machine_id)
+        cipher = Fernet(key)
+
+        if _STATE_PATH.exists():
+            try:
+                # Try to decrypt the file (new format)
+                with open(_STATE_PATH, 'rb') as f:
+                    encrypted_data = f.read()
+                decrypted = cipher.decrypt(encrypted_data)
+                return json.loads(decrypted)
+            except Exception:
+                pass
+
+            try:
+                # Fall back to plain JSON (old format)
+                with open(_STATE_PATH, encoding="utf-8") as f:
+                    state = json.load(f)
+                # Re-save in encrypted format
+                self.save_state(state)
+                return state
+            except Exception:
+                pass
+
+        # First run: create initial state
+        state = {
+            "first_run": str(date.today()),
+            "machine_id": machine_id,
+            "activated": False,
+            "key": None,
+            "key_expiry": None,
+            "activation_date": None,
+        }
+        self.save_state(state)
+        return state
+
+    def save_state(self, state=None):
+        """Encrypt and write state dict to ~/.license_monitor_state.json."""
+        if state is None:
+            state = self.state
+        try:
+            _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+            # Encrypt the JSON data
+            json_data = json.dumps(state, indent=2).encode()
+            key = _get_encryption_key(state.get("machine_id", self.get_machine_id()))
+            cipher = Fernet(key)
+            encrypted_data = cipher.encrypt(json_data)
+
+            # Write encrypted bytes
+            with open(_STATE_PATH, 'wb') as f:
+                f.write(encrypted_data)
+        except Exception:
+            pass
+
+    def check(self):
+        """Check license status. Returns (status_str, message_str).
+
+        Status values:
+          'ok' → fully activated, not expiring
+          'trial' → in trial period
+          'trial_expiring' → trial about to expire (< 7 days left)
+          'expired' → trial or key expired
+        """
+        today = date.today()
+
+        # Check if activated with a key
+        if self.state.get("activated") and self.state.get("key_expiry"):
+            try:
+                expiry = datetime.strptime(self.state["key_expiry"], "%Y-%m-%d").date()
+                if today > expiry:
+                    return ("expired", f"License key expired on {expiry}. Please enter a new key.")
+                days_left = (expiry - today).days
+                if days_left <= 7:
+                    return ("trial_expiring", f"License expires in {days_left} days. Please renew.")
+                return ("ok", f"Activated until {expiry}")
+            except Exception:
+                pass
+
+        # Check trial period
+        try:
+            first_run = datetime.strptime(self.state["first_run"], "%Y-%m-%d").date()
+            days_used = (today - first_run).days
+            days_remaining = _TRIAL_DAYS - days_used
+
+            if days_remaining <= 0:
+                return ("expired", "Trial period expired. Please enter a license key to continue.")
+            if days_remaining <= 7:
+                return ("trial_expiring", f"Trial expires in {days_remaining} days. Enter a license key to continue.")
+            return ("trial", f"Trial — {days_remaining} days remaining")
+        except Exception:
+            return ("expired", "Error reading trial state. Please enter a license key.")
+
+    def get_expiry_info(self):
+        """Return (expiry_date: date | None, days_remaining: int | None).
+        Works for both trial and activated states.
+        """
+        today = date.today()
+        if self.state.get("activated") and self.state.get("key_expiry"):
+            try:
+                expiry = datetime.strptime(self.state["key_expiry"], "%Y-%m-%d").date()
+                return (expiry, (expiry - today).days)
+            except Exception:
+                pass
+        # Trial
+        try:
+            first_run = datetime.strptime(self.state["first_run"], "%Y-%m-%d").date()
+            expiry = first_run + timedelta(days=_TRIAL_DAYS)
+            return (expiry, (_TRIAL_DAYS - (today - first_run).days))
+        except Exception:
+            return (None, None)
+
+    def validate_key_local(self, key):
+        """Validate key using local HMAC check. Returns (valid, message)."""
+        try:
+            # Parse key: LMON-EXPIRY8-MACHINESIG8-VERIFYSIG8
+            parts = key.strip().upper().split("-")
+            if len(parts) != 4 or parts[0] != "LMON":
+                return (False, "Invalid key format (expected LMON-XXXXXXXX-XXXXXXXX-XXXXXXXX)")
+
+            expiry_str = parts[1]  # YYYYMMDD
+            machine_sig = parts[2]
+            verify_sig = parts[3]
+
+            # Parse and validate expiry date
+            try:
+                expiry = datetime.strptime(expiry_str, "%Y%m%d").date()
+            except ValueError:
+                return (False, "Invalid expiry date in key")
+
+            if date.today() > expiry:
+                return (False, f"Key expired on {expiry}")
+
+            # Validate machine signature
+            current_machine_id = self.get_machine_id()
+            current_machine_short = self.get_machine_short(current_machine_id)
+
+            if machine_sig != current_machine_short:
+                return (False, "Key is locked to a different machine")
+
+            # Validate HMAC signature
+            sig_data = f"{expiry_str}:{machine_sig}".encode()
+            expected_sig = _hmac.new(_LICENSE_SECRET, sig_data, hashlib.sha256).hexdigest()[:8].upper()
+
+            if verify_sig != expected_sig:
+                return (False, "Invalid key signature (tampered key?)")
+
+            return (True, f"Key valid until {expiry}")
+        except Exception as e:
+            return (False, f"Error validating key: {str(e)}")
+
+    def validate_key_server(self, key):
+        """Validate key via server API. Returns (valid, message, expiry_str|None).
+
+        Only attempts if LICENSE_SERVER_URL is set and reachable.
+        Falls back silently to local validation on error.
+        """
+        if not _LICENSE_SERVER_URL:
+            return (None, "", None)  # Skip server check
+
+        try:
+            machine_id = self.get_machine_id()
+            payload = json.dumps({
+                "key": key,
+                "machine_id": machine_id,
+                "product": "LMON",
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                _LICENSE_SERVER_URL,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                return (data.get("valid", False), data.get("message", ""), data.get("expiry"))
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, Exception):
+            return (None, "", None)  # Fall back to local validation
+
+    def validate_key(self, key):
+        """Validate key via server (if available), then local. Returns (valid, message, expiry_str|None)."""
+        # Try server first
+        server_valid, server_msg, server_expiry = self.validate_key_server(key)
+        if server_valid is not None:  # Server responded
+            return (server_valid, server_msg, server_expiry)
+
+        # Fall back to local validation
+        local_valid, local_msg = self.validate_key_local(key)
+        if local_valid:
+            # Extract expiry from key for consistency
+            try:
+                parts = key.strip().upper().split("-")
+                if len(parts) >= 2:
+                    expiry_str = parts[1]
+                    expiry = datetime.strptime(expiry_str, "%Y%m%d").date()
+                    return (True, local_msg, expiry.isoformat())
+            except Exception:
+                pass
+        return (local_valid, local_msg, None)
+
+    def activate(self, key):
+        """Validate and activate a key. Returns (success, message)."""
+        valid, msg, expiry_str = self.validate_key(key)
+        if not valid:
+            return (False, msg)
+
+        # Update state
+        self.state["activated"] = True
+        self.state["key"] = key
+        self.state["key_expiry"] = expiry_str or date.today().isoformat()
+        self.state["activation_date"] = str(date.today())
+        self.save_state(self.state)
+
+        return (True, f"License activated successfully. Expires: {self.state['key_expiry']}")
+
+
+# ============================================================
+# LicenseDialog — authorization/trial dialog
+# ============================================================
+
+from PyQt5.QtWidgets import QDialog
+
+class LicenseDialog(QDialog):
+    """Dialog for trial countdown and license key activation."""
+
+    def __init__(self, parent, license_manager, allow_skip=True):
+        super().__init__(parent)
+        self.setWindowTitle("License Monitor — Authorization")
+        self.setModal(True)
+        self.setGeometry(100, 100, 500, 400)
+        self.license_manager = license_manager
+        self.allow_skip = allow_skip
+
+        # Get current status for display
+        status, msg = license_manager.check()
+        machine_short = license_manager.get_machine_short()
+
+        # Layout
+        layout = QVBoxLayout()
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Title
+        title = QLabel("License Monitor Authorization")
+        title.setStyleSheet("font-weight: bold; font-size: 14pt;")
+        layout.addWidget(title)
+
+        # Status message
+        status_label = QLabel(msg)
+        status_label.setStyleSheet("color: #1a5c8c; font-size: 11pt;")
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+
+        # Expiry info block
+        layout.addSpacing(6)
+        expiry_date, days_left = license_manager.get_expiry_info()
+
+        info_frame = QFrame()
+        info_frame.setFrameShape(QFrame.StyledPanel)
+        info_frame.setStyleSheet("background-color: #f5f5f5; border-radius: 6px; padding: 8px;")
+        info_layout = QVBoxLayout(info_frame)
+        info_layout.setSpacing(4)
+
+        if expiry_date:
+            date_row = QHBoxLayout()
+            date_row.addWidget(QLabel("Expires:"))
+            date_val = QLabel(str(expiry_date))
+            date_val.setStyleSheet("font-weight: bold; color: #1a5c8c;")
+            date_row.addWidget(date_val)
+            date_row.addStretch()
+            info_layout.addLayout(date_row)
+
+        if days_left is not None:
+            days_label = QLabel()
+            if days_left > 0:
+                days_label.setText(f"{days_left} day{'s' if days_left != 1 else ''} remaining")
+                color = "#2e7d32" if days_left > 14 else ("#e65100" if days_left > 7 else "#c62828")
+            else:
+                days_label.setText("Expired")
+                color = "#c62828"
+            days_label.setStyleSheet(f"font-size: 13pt; font-weight: bold; color: {color};")
+            info_layout.addWidget(days_label)
+
+        layout.addWidget(info_frame)
+
+        # Machine ID info
+        layout.addSpacing(8)
+        machine_label = QLabel("Machine ID (share with vendor for key generation):")
+        machine_label.setStyleSheet("font-weight: bold; font-size: 10pt;")
+        layout.addWidget(machine_label)
+
+        machine_id_field = QLineEdit()
+        machine_id_field.setText(f"LMON-{machine_short}")
+        machine_id_field.setReadOnly(True)
+        machine_id_field.setStyleSheet("background-color: #f0f0f0; padding: 4px;")
+        layout.addWidget(machine_id_field)
+
+        # Key entry
+        layout.addSpacing(12)
+        key_label = QLabel("Enter License Key:")
+        key_label.setStyleSheet("font-weight: bold; font-size: 10pt;")
+        layout.addWidget(key_label)
+
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("LMON-XXXXXXXX-XXXXXXXX-XXXXXXXX")
+        self.key_input.textChanged.connect(self._auto_uppercase)
+        layout.addWidget(self.key_input)
+
+        # Buttons
+        layout.addSpacing(12)
+        button_layout = QHBoxLayout()
+
+        activate_btn = QPushButton("Activate")
+        activate_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px; border-radius: 4px;")
+        activate_btn.clicked.connect(self._on_activate)
+        button_layout.addWidget(activate_btn)
+
+        if allow_skip:
+            continue_btn = QPushButton("Continue Trial")
+            continue_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 8px; border-radius: 4px;")
+            continue_btn.clicked.connect(self.accept)
+            button_layout.addWidget(continue_btn)
+
+        exit_btn = QPushButton("Exit Application")
+        exit_btn.setStyleSheet("background-color: #999; color: white; padding: 8px; border-radius: 4px;")
+        exit_btn.clicked.connect(self.reject)
+        button_layout.addWidget(exit_btn)
+
+        layout.addLayout(button_layout)
+        layout.addStretch()
+
+        self.setLayout(layout)
+
+    def _auto_uppercase(self):
+        """Auto-uppercase key input."""
+        cursor_pos = self.key_input.cursorPosition()
+        self.key_input.blockSignals(True)
+        self.key_input.setText(self.key_input.text().upper())
+        self.key_input.setCursorPosition(cursor_pos)
+        self.key_input.blockSignals(False)
+
+    def _on_activate(self):
+        """Attempt to activate key."""
+        key = self.key_input.text().strip()
+        if not key:
+            QMessageBox.warning(self, "Empty Key", "Please enter a license key.")
+            return
+
+        success, msg = self.license_manager.activate(key)
+        if success:
+            QMessageBox.information(self, "Activation Success", msg)
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Activation Failed", msg)
 
 
 # ============================================================
@@ -536,6 +944,7 @@ class LicenseMonitorGUI(QMainWindow):
         self._load_policy()
         self._load_config()
         self._check_existing_exports()  # Enable View button if exports exist
+        self._update_license_status_bar()  # Show expiry date in status bar
 
     # --------------------------------------------------------
     # UI construction
@@ -651,6 +1060,12 @@ class LicenseMonitorGUI(QMainWindow):
         self.ingest_policy_btn.setToolTip("Run ingest_policy.py to reload policy from options.opt into the database")
         self.ingest_policy_btn.clicked.connect(self._run_ingest_policy)
         action_row3.addWidget(self.ingest_policy_btn)
+
+        self.manage_license_btn = QPushButton("Manage License")
+        self.manage_license_btn.setToolTip("View license status or activate a license key")
+        self.manage_license_btn.clicked.connect(self._manage_license)
+        action_row3.addWidget(self.manage_license_btn)
+
         action_layout.addLayout(action_row3)
 
         action_group.setLayout(action_layout)
@@ -1070,6 +1485,33 @@ class LicenseMonitorGUI(QMainWindow):
         self.ingest_policy_btn.setEnabled(True)
         self.status_bar.showMessage(f"Ingest error: {msg[:100]}")
         QMessageBox.warning(self, "Ingest Error", msg)
+
+    def _manage_license(self):
+        """Open the license management dialog."""
+        lm = LicenseManager()
+        dlg = LicenseDialog(self, lm, allow_skip=True)
+        dlg.exec_()
+
+    def _update_license_status_bar(self):
+        """Update Manage License button to show license/trial expiry date."""
+        try:
+            lm = LicenseManager()
+            expiry_date, days_left = lm.get_expiry_info()
+
+            if expiry_date and days_left is not None:
+                if days_left > 0:
+                    self.manage_license_btn.setText(f"Expires: {expiry_date}")
+                    self.manage_license_btn.setStyleSheet(
+                        "background-color: #e1bee7; color: black; padding: 4px 8px; border-radius: 3px;"
+                    )
+                else:
+                    self.manage_license_btn.setText("Manage License\n(Expired)")
+                    self.manage_license_btn.setStyleSheet("")
+            else:
+                self.manage_license_btn.setText("Manage License")
+                self.manage_license_btn.setStyleSheet("")
+        except Exception:
+            pass  # Silently fail if license info unavailable
 
     # --------------------------------------------------------
     # Chart options helpers
@@ -2948,12 +3390,67 @@ function switchTab(tabId) {{
 
 
 # ============================================================
+# License Key Generator (for vendor use)
+# ============================================================
+
+def generate_license_key(expiry_date_str, machine_short, secret=_LICENSE_SECRET):
+    """Generate a license key for a given expiry and machine.
+
+    Args:
+        expiry_date_str: Expiry date as 'YYYY-MM-DD' or 'YYYYMMDD'
+        machine_short: 8-character machine identifier (first 8 chars of machine SHA256)
+        secret: HMAC secret key (defaults to embedded secret)
+
+    Returns:
+        License key string in format: LMON-YYYYMMDD-MACHINESIG-VERIFYSIG
+
+    Example:
+        key = generate_license_key('2026-12-31', 'A1B2C3D4')
+        # Returns: 'LMON-20261231-A1B2C3D4-E5F67890'
+
+    Usage (vendor generates keys offline):
+        from gui_license_monitor import generate_license_key
+        key = generate_license_key('2027-03-31', 'A1B2C3D4')
+        print(f"Key: {key}")
+    """
+    # Parse expiry date
+    if "-" in expiry_date_str:
+        expiry_str = expiry_date_str.replace("-", "")[:8].upper()
+    else:
+        expiry_str = expiry_date_str[:8].upper()
+
+    # Ensure machine_short is 8 uppercase hex chars
+    ms = machine_short.upper()[:8]
+
+    # Generate HMAC signature
+    sig_data = f"{expiry_str}:{ms}".encode()
+    sig = _hmac.new(secret, sig_data, hashlib.sha256).hexdigest()[:8].upper()
+
+    return f"LMON-{expiry_str}-{ms}-{sig}"
+
+
+# ============================================================
 # Entry point
 # ============================================================
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # License check: trial period or key validation
+    lm = LicenseManager()
+    status, msg = lm.check()
+    if status in ("expired",):
+        # Must enter key to continue (no skip option)
+        dlg = LicenseDialog(None, lm, allow_skip=False)
+        if dlg.exec_() != QDialog.Accepted:
+            sys.exit(0)
+    elif status in ("trial", "trial_expiring"):
+        # Show reminder, can skip for now
+        dlg = LicenseDialog(None, lm, allow_skip=True)
+        dlg.exec_()  # user can continue trial by closing dialog
+    # status == 'ok': fully activated, no dialog needed
+
     gui = LicenseMonitorGUI()
     gui.show()
     sys.exit(app.exec_())
