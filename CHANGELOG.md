@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- State file encryption with Fernet (AES-128-CBC + HMAC)
+  - Encrypts ~/.license_monitor_state.json to prevent casual file tampering
+  - Per-machine encryption key derived from hardware identifiers (hostname, CPU, MAC)
+  - Transparent to users—no password or configuration needed
+  - Backward compatible: automatically migrates plain JSON files to encrypted format
+  - Adds cryptography>=41.0.0 dependency
 - HTML export progress tracking with detailed step-by-step updates
   - Shows progress bar with percentage (0-100%)
   - Displays current step (e.g., "rendering chart", "[1/2] company stats")
